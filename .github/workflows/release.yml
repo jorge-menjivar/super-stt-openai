@@ -1,0 +1,55 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Cache dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # One artifact: the wasm32-wasip2 component. No cross/CUDA matrix — a WASM
+      # component is architecture-independent.
+      - name: Build component
+        run: cargo build --release --locked --target wasm32-wasip2
+
+      # Rename to the entrypoint / [assets].wasm name the daemon downloads.
+      - name: Stage release asset
+        run: cp target/wasm32-wasip2/release/super_stt_backend_openai.wasm openai.wasm
+
+      # Attach the component AND backend.toml. The indexer hashes backend.toml's
+      # bytes into the registry's manifest pin, and the daemon re-verifies the
+      # installed manifest against that hash (reviewed == pinned == installed).
+      # Checkout above brings the tag's backend.toml into scope.
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            openai.wasm
+            backend.toml
+          generate_release_notes: true

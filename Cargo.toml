@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Standalone OpenAI WASM backend. Depends only on third-party crates — no
+# super-stt code. Its own workspace root, with its own Cargo.lock.
+#
+# The library is a `wasi:http` component (cdylib) built for wasm32-wasip2; the
+# `rlib` target lets the host integration tests link/run alongside the wasmtime
+# harness that loads the prebuilt component.
+[package]
+    name = "super-stt-backend-openai"
+    version = "0.1.0"
+    edition = "2024"
+    license = "GPL-3.0-only"
+    publish = false
+
+# Own workspace root — never absorbed into a parent workspace.
+[workspace]
+
+[lib]
+    crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+    serde_json = "1.0.150"
+    wasi = "0.14.7"
+
+# Host-only test harness: a minimal wasmtime `wasi:http` host that loads the
+# prebuilt component and drives the /v1 contract against a wiremock upstream
+# (the standalone analog of the daemon's WasmBackend — "mock the daemon").
+[dev-dependencies]
+    anyhow = "1"
+    bytes = "1"
+    hound = "3.5"
+    http-body-util = "0.1"
+    hyper = { version = "1", features = ["http1"] }
+    tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+    wasmtime = { version = "45", features = ["async"] }
+    wasmtime-wasi = "45"
+    wasmtime-wasi-http = "45"
+    wiremock = "0.6.5"
