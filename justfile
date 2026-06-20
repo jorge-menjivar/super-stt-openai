@@ -38,11 +38,11 @@ test *args: build-component
 # covers the pure helpers + test harness. The harness loads the prebuilt
 # component, so build it first. Usage: just coverage [--html]
 coverage *args: build-component
-    cargo llvm-cov --locked {{ args }}
+    cargo llvm-cov --locked --remap-path-prefix {{ args }}
 
 # Coverage for CI: write lcov.info and print a summary.
 coverage-lcov: build-component
-    cargo llvm-cov --locked --lcov --output-path lcov.info
+    cargo llvm-cov --locked --remap-path-prefix --lcov --output-path lcov.info
     cargo llvm-cov report --summary-only
 
 # Full local CI gate: format, lint (component + host), build, test
