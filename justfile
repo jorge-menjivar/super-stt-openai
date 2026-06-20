@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-only
-# Task runner for the standalone Deepgram WASM backend. Mirrors the recipe names
+# Task runner for the standalone OpenAI WASM backend. Mirrors the recipe names
 # used by the main super-stt repo (`just check`, `just ci`, etc.).
 
 # Default: build the component
@@ -32,6 +32,18 @@ fmt-check:
 # it first. Usage: just test [--verbose]
 test *args: build-component
     cargo test --locked {{ args }}
+
+# Measure code coverage of the host-compiled code (requires cargo-llvm-cov). The
+# component runs in wasmtime (wasm32) and isn't host-instrumentable, so this
+# covers the pure helpers + test harness. The harness loads the prebuilt
+# component, so build it first. Usage: just coverage [--html]
+coverage *args: build-component
+    cargo llvm-cov --locked {{ args }}
+
+# Coverage for CI: write lcov.info and print a summary.
+coverage-lcov: build-component
+    cargo llvm-cov --locked --lcov --output-path lcov.info
+    cargo llvm-cov report --summary-only
 
 # Full local CI gate: format, lint (component + host), build, test
 ci: fmt-check check check-host build-component test

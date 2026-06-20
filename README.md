@@ -1,5 +1,7 @@
 # Super STT — OpenAI backend
 
+[![coverage](https://img.shields.io/endpoint?url=https://jorge-menjivar.github.io/super-stt-openai/coverage.json)](https://jorge-menjivar.github.io/super-stt-openai/)
+
 A speech-to-text backend for **[Super STT](https://github.com/jorge-menjivar/super-stt)**.
 It proxies audio to [OpenAI](https://platform.openai.com/docs/guides/speech-to-text)'s
 hosted transcription API, so transcription runs in the cloud rather than on your machine.
