@@ -35,15 +35,17 @@ test *args: build-component
 
 # Measure code coverage of the host-compiled code (requires cargo-llvm-cov). The
 # component runs in wasmtime (wasm32) and isn't host-instrumentable, so this
-# covers the pure helpers + test harness. The harness loads the prebuilt
-# component, so build it first. Usage: just coverage [--html]
+# covers the pure helpers in src/; test code under tests/ is excluded, and
+# --remap-path-prefix keeps report paths relative (src/lib.rs, not the absolute
+# build path). The harness loads the prebuilt component, so build it first.
+# Usage: just coverage [--html]
 coverage *args: build-component
-    cargo llvm-cov --locked --remap-path-prefix {{ args }}
+    cargo llvm-cov --locked --remap-path-prefix --ignore-filename-regex 'tests/' {{ args }}
 
 # Coverage for CI: write lcov.info and print a summary.
 coverage-lcov: build-component
-    cargo llvm-cov --locked --remap-path-prefix --lcov --output-path lcov.info
-    cargo llvm-cov report --summary-only
+    cargo llvm-cov --locked --remap-path-prefix --ignore-filename-regex 'tests/' --lcov --output-path lcov.info
+    cargo llvm-cov report --summary-only --ignore-filename-regex 'tests/'
 
 # Full local CI gate: format, lint (component + host), build, test
 ci: fmt-check check check-host build-component test
