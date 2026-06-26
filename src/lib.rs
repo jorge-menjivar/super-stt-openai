@@ -75,14 +75,21 @@ pub fn encode_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     buf
 }
 
-/// Build a `multipart/form-data` body with `model` and `file` (audio.wav).
+/// Build a `multipart/form-data` body with `model`, an optional `language`, and
+/// `file` (audio.wav).
 #[must_use]
-pub fn build_multipart(boundary: &str, model: &str, wav: &[u8]) -> Vec<u8> {
+pub fn build_multipart(boundary: &str, model: &str, language: Option<&str>, wav: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
     body.extend_from_slice(b"Content-Disposition: form-data; name=\"model\"\r\n\r\n");
     body.extend_from_slice(model.as_bytes());
     body.extend_from_slice(b"\r\n");
+    if let Some(lang) = language {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"language\"\r\n\r\n");
+        body.extend_from_slice(lang.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
     body.extend_from_slice(
         b"Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
@@ -189,8 +196,14 @@ mod component {
                 .unwrap_or(16000),
         )
         .unwrap_or(16000);
+        // OpenAI auto-detects when `language` is omitted, so the reserved `auto`
+        // (and a missing field) map to "no language"; a specific code forwards.
+        let language = match req.get("language").and_then(|v| v.as_str()) {
+            Some("auto") | None => None,
+            Some(code) => Some(code),
+        };
 
-        match call_openai(&base_url, &api_key, &model, &audio, sample_rate) {
+        match call_openai(&base_url, &api_key, &model, language, &audio, sample_rate) {
             Ok(text) => (
                 200,
                 to_vec(&serde_json::json!({ "status": "success", "transcription": text })),
@@ -209,12 +222,13 @@ mod component {
         base_url: &str,
         api_key: &str,
         model: &str,
+        language: Option<&str>,
         audio: &[f32],
         sample_rate: u32,
     ) -> Result<String, String> {
         let wav = encode_wav(audio, sample_rate);
         let boundary = "----superstt7MA4YWxkTrZu0gW";
-        let multipart = build_multipart(boundary, model, &wav);
+        let multipart = build_multipart(boundary, model, language, &wav);
         let (https, authority) = parse_base(base_url);
         let scheme = if https { Scheme::Https } else { Scheme::Http };
 
@@ -398,7 +412,7 @@ mod tests {
 
     #[test]
     fn build_multipart_frames_model_and_file() {
-        let body = build_multipart("BOUNDARY", "whisper-1", b"WAVDATA");
+        let body = build_multipart("BOUNDARY", "whisper-1", None, b"WAVDATA");
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("--BOUNDARY\r\n"));
         assert!(text.contains("name=\"model\""));
@@ -406,7 +420,17 @@ mod tests {
         assert!(text.contains("name=\"file\"; filename=\"audio.wav\""));
         assert!(text.contains("Content-Type: audio/wav"));
         assert!(text.contains("WAVDATA"));
+        // No language part when none is given.
+        assert!(!text.contains("name=\"language\""));
         // Closing boundary.
         assert!(text.ends_with("--BOUNDARY--\r\n"));
+    }
+
+    #[test]
+    fn build_multipart_includes_language_when_present() {
+        let body = build_multipart("BOUNDARY", "whisper-1", Some("es"), b"WAVDATA");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("name=\"language\""));
+        assert!(text.contains("\r\n\r\nes\r\n"));
     }
 }

@@ -30,7 +30,13 @@
     provider = "openai"
     multilingual = true
     primary_language = "en"
-    supported_languages = ["en"]
+    supported_languages = [
+        "en", "af", "ar", "az", "be", "bg", "bs", "ca", "cs", "cy", "da", "de",
+        "el", "es", "et", "fa", "fi", "fr", "gl", "he", "hi", "hr", "hu", "hy",
+        "id", "is", "it", "ja", "kk", "kn", "ko", "lt", "lv", "mi", "mk", "mr",
+        "ms", "ne", "nl", "no", "pl", "pt", "ro", "ru", "sk", "sl", "sr", "sv",
+        "sw", "ta", "th", "tl", "tr", "uk", "ur", "vi", "zh",
+    ]
     supported_devices = ["none"]
 
 [[models]]
@@ -38,7 +44,13 @@
     provider = "openai"
     multilingual = true
     primary_language = "en"
-    supported_languages = ["en"]
+    supported_languages = [
+        "en", "af", "ar", "az", "be", "bg", "bs", "ca", "cs", "cy", "da", "de",
+        "el", "es", "et", "fa", "fi", "fr", "gl", "he", "hi", "hr", "hu", "hy",
+        "id", "is", "it", "ja", "kk", "kn", "ko", "lt", "lv", "mi", "mk", "mr",
+        "ms", "ne", "nl", "no", "pl", "pt", "ro", "ru", "sk", "sl", "sr", "sv",
+        "sw", "ta", "th", "tl", "tr", "uk", "ur", "vi", "zh",
+    ]
     supported_devices = ["none"]
 
 [[models]]
@@ -46,5 +58,11 @@
     provider = "openai"
     multilingual = true
     primary_language = "en"
-    supported_languages = ["en"]
+    supported_languages = [
+        "en", "af", "ar", "az", "be", "bg", "bs", "ca", "cs", "cy", "da", "de",
+        "el", "es", "et", "fa", "fi", "fr", "gl", "he", "hi", "hr", "hu", "hy",
+        "id", "is", "it", "ja", "kk", "kn", "ko", "lt", "lv", "mi", "mk", "mr",
+        "ms", "ne", "nl", "no", "pl", "pt", "ro", "ru", "sk", "sl", "sr", "sv",
+        "sw", "ta", "th", "tl", "tr", "uk", "ur", "vi", "zh",
+    ]
     supported_devices = ["none"]

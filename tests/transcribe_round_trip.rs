@@ -10,10 +10,20 @@ mod common;
 
 use common::{WasmBackend, component_path};
 use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
 const SECRET: &str = "x-stt-secret-openai_api_key";
 const BASE_URL: &str = "x-stt-option-base_url";
+
+/// A `wiremock` matcher asserting the request body contains `needle`. Decodes
+/// lossily because the multipart body carries binary WAV bytes (invalid UTF-8);
+/// the `language` field is plain ASCII and precedes the audio, so it survives.
+struct BodyContains(&'static str);
+impl Match for BodyContains {
+    fn matches(&self, req: &Request) -> bool {
+        String::from_utf8_lossy(&req.body).contains(self.0)
+    }
+}
 
 /// Happy path: Bearer auth + `multipart/form-data` body reach the allowlisted
 /// upstream at `/v1/audio/transcriptions`, and the response `text` comes back as
@@ -62,6 +72,46 @@ async fn transcribe_round_trip() {
         .await
         .expect("transcription should succeed");
     assert_eq!(text, "hello world");
+}
+
+/// A chosen `language` is forwarded to OpenAI as a `language` multipart field.
+#[tokio::test]
+async fn language_forwarded_in_multipart() {
+    let Some(component) = component_path() else {
+        eprintln!("skipping: component not built (run `just build-component`)");
+        return;
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        // The component adds a `language` form field carrying the chosen code.
+        .and(BodyContains("name=\"language\"\r\n\r\nes\r\n"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "hola mundo" })),
+        )
+        .mount(&server)
+        .await;
+
+    let authority = server.address().to_string();
+    let mut backend = WasmBackend::new(
+        &component,
+        vec![authority.clone()],
+        "whisper-1".to_string(),
+        vec![
+            (SECRET.to_string(), "test-key".to_string()),
+            (BASE_URL.to_string(), format!("http://{authority}")),
+        ],
+    )
+    .expect("load backend")
+    .permit_loopback_egress();
+
+    let audio = vec![0.0_f32; 1600];
+    let text = backend
+        .transcribe_with_language(&audio, 16000, Some("es"))
+        .await
+        .expect("transcription should succeed");
+    assert_eq!(text, "hola mundo");
 }
 
 /// The allowlist blocks egress to a host the configuration does not permit, even

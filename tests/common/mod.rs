@@ -293,10 +293,30 @@ impl WasmBackend {
     /// Returns an error if the component cannot be invoked or the backend
     /// reports a non-success status.
     pub async fn transcribe_audio(&mut self, audio: &[f32], sample_rate: u32) -> Result<String> {
-        let body = serde_json::to_vec(&serde_json::json!({
+        self.transcribe_with_language(audio, sample_rate, None)
+            .await
+    }
+
+    /// Like [`Self::transcribe_audio`], with an explicit `language` in the
+    /// request body — a BCP-47 tag or the reserved `auto`.
+    ///
+    /// # Errors
+    /// Returns an error if the component cannot be invoked or the backend
+    /// reports a non-success status.
+    pub async fn transcribe_with_language(
+        &mut self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+    ) -> Result<String> {
+        let mut payload = serde_json::json!({
             "audio_data": audio,
             "sample_rate": sample_rate,
-        }))?;
+        });
+        if let Some(lang) = language {
+            payload["language"] = serde_json::Value::String(lang.to_string());
+        }
+        let body = serde_json::to_vec(&payload)?;
         let mut headers = self.transcribe_headers.clone();
         headers.push(("x-stt-model".to_string(), self.model_id.clone()));
         let (status, resp) = self
