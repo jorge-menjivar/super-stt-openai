@@ -10,6 +10,7 @@
     entrypoint = "openai.wasm"
     contract = "v1"
     license = "GPL-3.0-only"
+    description = "Cloud speech-to-text via the OpenAI API."
 
 [assets]
     # Filename of the wasm component attached to the GitHub release. The indexer
