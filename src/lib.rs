@@ -97,6 +97,55 @@ pub fn resolve_model(selected: &str, custom: Option<&str>) -> Option<String> {
         .map(String::from)
 }
 
+/// The URL a request was aimed at, as the user would recognize it.
+///
+/// Every failure below names it. The daemon shows a backend's `detail` to the
+/// user, and the endpoint is the one thing that turns "it did not work" into a
+/// setting they can go and check.
+#[must_use]
+pub fn endpoint_url(https: bool, authority: &str, path: &str) -> String {
+    let scheme = if https { "https" } else { "http" };
+    format!("{scheme}://{authority}{path}")
+}
+
+/// Detail for a request that never got a reply: the connection failed, or died
+/// while the body was going out.
+///
+/// Over `https` this names the mismatch that produces it most often. A base URL
+/// naming no scheme is read as `https` unless its host is visibly local, so a
+/// plaintext server behind a hostname is reached over TLS and the connection
+/// dies — wherever the write happens to notice it, which is why the underlying
+/// cause can read as a write problem rather than a connection one.
+#[must_use]
+pub fn unreachable_detail(endpoint: &str, https: bool, cause: &str) -> String {
+    let hint = if https {
+        " Check the server is running and reachable on that port, and that it accepts https — a plaintext server reached over https fails exactly this way."
+    } else {
+        " Check the server is running and reachable on that port."
+    };
+    format!("Could not reach {endpoint} ({cause}).{hint}")
+}
+
+/// Detail for a reply that arrived carrying a non-2xx status.
+///
+/// The upstream's own body is the useful part — an OpenAI-compatible server
+/// explains a bad model name or a rejected key there — so it is passed through,
+/// bounded, rather than replaced.
+#[must_use]
+pub fn upstream_status_detail(endpoint: &str, status: u16, body: &[u8]) -> String {
+    const MAX: usize = 300;
+    let text = String::from_utf8_lossy(body);
+    let text = text.trim();
+    if text.is_empty() {
+        return format!("{endpoint} returned HTTP {status}.");
+    }
+    let mut shown: String = text.chars().take(MAX).collect();
+    if shown.chars().count() < text.chars().count() {
+        shown.push('…');
+    }
+    format!("{endpoint} returned HTTP {status}: {shown}")
+}
+
 /// Extract the transcript from an OpenAI transcription response (the `text`
 /// field).
 ///
@@ -168,8 +217,8 @@ pub fn build_multipart(boundary: &str, model: &str, language: Option<&str>, wav:
 #[cfg(target_arch = "wasm32")]
 mod component {
     use super::{
-        DEFAULT_BASE_URL, build_multipart, encode_wav, needs_api_key, parse_base, parse_transcript,
-        resolve_model,
+        DEFAULT_BASE_URL, build_multipart, encode_wav, endpoint_url, needs_api_key, parse_base,
+        parse_transcript, resolve_model, unreachable_detail, upstream_status_detail,
     };
 
     use wasi::exports::http::incoming_handler::Guest;
@@ -322,6 +371,17 @@ mod component {
         let multipart = build_multipart(boundary, model, language, &wav);
         let (https, authority, prefix) = parse_base(base_url);
         let scheme = if https { Scheme::Https } else { Scheme::Http };
+        let path = format!("{prefix}/audio/transcriptions");
+        // Named in every failure below: the daemon shows `detail` to the user,
+        // and this is what points them at the setting to check.
+        let endpoint = endpoint_url(https, &authority, &path);
+        // A request this backend could not even assemble means the base URL is
+        // not something a URL can be built from. Unreachable in practice — the
+        // daemon canonicalizes the value before injecting it — so it names the
+        // setting rather than trying to diagnose further.
+        let malformed = |cause: &str| {
+            format!("Could not build a request for {endpoint} ({cause}). Check the API base URL.")
+        };
 
         let headers = Fields::new();
         // No key means no `authorization` header — an empty `Bearer` is worse
@@ -329,57 +389,65 @@ mod component {
         if let Some(key) = api_key {
             headers
                 .append("authorization", format!("Bearer {key}").as_bytes())
-                .map_err(|e| format!("header: {e:?}"))?;
+                .map_err(|e| malformed(&format!("header: {e:?}")))?;
         }
         headers
             .append(
                 "content-type",
                 format!("multipart/form-data; boundary={boundary}").as_bytes(),
             )
-            .map_err(|e| format!("header: {e:?}"))?;
+            .map_err(|e| malformed(&format!("header: {e:?}")))?;
 
         let request = OutgoingRequest::new(headers);
         request
             .set_method(&Method::Post)
-            .map_err(|()| "set_method")?;
+            .map_err(|()| malformed("set_method"))?;
         request
             .set_scheme(Some(&scheme))
-            .map_err(|()| "set_scheme")?;
+            .map_err(|()| malformed("set_scheme"))?;
         request
             .set_authority(Some(&authority))
-            .map_err(|()| "set_authority")?;
+            .map_err(|()| malformed("set_authority"))?;
         request
-            .set_path_with_query(Some(&format!("{prefix}/audio/transcriptions")))
-            .map_err(|()| "set_path")?;
+            .set_path_with_query(Some(&path))
+            .map_err(|()| malformed("set_path"))?;
 
         // Obtain the body handle, start the request, then stream the body — the
         // canonical wasi:http outbound order.
-        let out_body = request.body().map_err(|()| "request_body")?;
+        //
+        // Everything from here to the response is a failure to *reach* the
+        // server. The write is the usual place a dead connection surfaces,
+        // because `handle` returns before the connection is established and the
+        // body is what first tries to use it.
+        let unreachable = |cause: &str| unreachable_detail(&endpoint, https, cause);
+        let out_body = request.body().map_err(|()| unreachable("request_body"))?;
         let future = wasi::http::outgoing_handler::handle(request, None)
-            .map_err(|e| format!("handle: {e:?}"))?;
-        write_all(&out_body, &multipart)?;
-        OutgoingBody::finish(out_body, None).map_err(|e| format!("finish: {e:?}"))?;
+            .map_err(|e| unreachable(&format!("{e:?}")))?;
+        write_all(&out_body, &multipart).map_err(|e| unreachable(&e))?;
+        OutgoingBody::finish(out_body, None).map_err(|e| unreachable(&format!("{e:?}")))?;
 
         let pollable = future.subscribe();
         pollable.block();
         let response = future
             .get()
-            .ok_or("no_response")?
-            .map_err(|()| "future_taken")?
-            .map_err(|e| format!("http: {e:?}"))?;
+            .ok_or_else(|| unreachable("no_response"))?
+            .map_err(|()| unreachable("future_taken"))?
+            .map_err(|e| unreachable(&format!("{e:?}")))?;
 
         let status = response.status();
-        let body = response.consume().map_err(|()| "response_consume")?;
-        let bytes = read_all(body)?;
+        let body = response
+            .consume()
+            .map_err(|()| format!("{endpoint} returned a response that could not be read."))?;
+        let bytes = read_all(body)
+            .map_err(|e| format!("{endpoint} returned a response that could not be read ({e})."))?;
         if !(200..300).contains(&status) {
-            return Err(format!(
-                "status {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            ));
+            return Err(upstream_status_detail(&endpoint, status, &bytes));
         }
 
         // OpenAI response: { "text": "…" }
-        parse_transcript(&bytes)
+        parse_transcript(&bytes).map_err(|e| {
+            format!("{endpoint} replied without a transcript ({e}). It may not be an OpenAI-compatible transcription endpoint.")
+        })
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
@@ -459,8 +527,8 @@ mod component {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_BASE_URL, build_multipart, encode_wav, needs_api_key, parse_base, parse_transcript,
-        resolve_model,
+        DEFAULT_BASE_URL, build_multipart, encode_wav, endpoint_url, needs_api_key, parse_base,
+        parse_transcript, resolve_model, unreachable_detail, upstream_status_detail,
     };
 
     /// The canonical values the daemon injects: scheme present, no trailing
@@ -588,6 +656,66 @@ mod tests {
         assert!(resolve_model("other", None).is_none());
         assert!(resolve_model("other", Some("")).is_none());
         assert!(resolve_model("other", Some("   ")).is_none());
+    }
+
+    /// The endpoint is what makes a failure actionable, so it is rebuilt the
+    /// way the request was addressed rather than echoing the raw option.
+    #[test]
+    fn endpoint_url_reads_back_as_the_request_was_addressed() {
+        assert_eq!(
+            endpoint_url(false, "192.168.0.179:8080", "/v1/audio/transcriptions"),
+            "http://192.168.0.179:8080/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            endpoint_url(true, "api.openai.com", "/v1/audio/transcriptions"),
+            "https://api.openai.com/v1/audio/transcriptions"
+        );
+    }
+
+    /// The failure a user actually hit: a plaintext server reached over https.
+    /// The cause `write_failed` says nothing on its own, so the detail names
+    /// the endpoint and the mismatch that produces it.
+    #[test]
+    fn unreachable_detail_names_the_endpoint_and_the_scheme_trap() {
+        let over_tls = unreachable_detail(
+            "https://192.168.0.179:8080/v1/audio/transcriptions",
+            true,
+            "write_failed",
+        );
+        assert!(over_tls.contains("192.168.0.179:8080"), "{over_tls}");
+        assert!(over_tls.contains("write_failed"), "{over_tls}");
+        assert!(over_tls.contains("plaintext server"), "{over_tls}");
+
+        // Over http there is no scheme mismatch to suggest, so it is not
+        // suggested — a wrong guess sends the user down the wrong path.
+        let plain = unreachable_detail(
+            "http://192.168.0.179:8080/v1/audio/transcriptions",
+            false,
+            "write_failed",
+        );
+        assert!(plain.contains("192.168.0.179:8080"), "{plain}");
+        assert!(!plain.contains("plaintext server"), "{plain}");
+    }
+
+    #[test]
+    fn upstream_status_detail_passes_the_server_explanation_through() {
+        let d = upstream_status_detail(
+            "http://gw.local/v1/audio/transcriptions",
+            404,
+            br#"{"error":"model whisper-tiny not found"}"#,
+        );
+        assert!(d.contains("404"), "{d}");
+        assert!(d.contains("model whisper-tiny not found"), "{d}");
+
+        // An empty body still yields a sentence, not a dangling colon.
+        let empty = upstream_status_detail("http://gw.local/v1/audio/transcriptions", 502, b"   ");
+        assert!(empty.ends_with("returned HTTP 502."), "{empty}");
+
+        // A server that answers an API call with a whole HTML page does not get
+        // to fill the notification.
+        let long = upstream_status_detail("http://gw.local/x", 500, &vec![b'x'; 5000]);
+        assert!(long.chars().count() < 400, "{}", long.chars().count());
+        assert!(long.ends_with('…'), "{long}");
     }
 
     #[test]
