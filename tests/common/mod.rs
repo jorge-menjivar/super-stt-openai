@@ -116,6 +116,12 @@ impl WasiHttpHooks for AllowlistHooks {
 }
 
 fn guard_egress_host(host: &str, port: u16, allow_loopback: bool) -> Result<(), String> {
+    // `Uri::host` keeps the brackets around an IPv6 literal (`[::1]`); they are
+    // URI syntax, not part of the address, so strip them before parsing.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     if let Ok(ip) = host.parse::<IpAddr>() {
         if allow_loopback && ip.is_loopback() {
             return Ok(());

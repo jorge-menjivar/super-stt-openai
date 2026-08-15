@@ -5,14 +5,16 @@
 //! (`docs/protocol/backend/contract.md`) by exporting
 //! `wasi:http/incoming-handler` and dispatching on method + path. The
 //! component is stateless: the daemon injects the API key as the
-//! `x-stt-secret-openai_api_key` request header and the model in the
-//! transcribe body, and the component forwards audio to the OpenAI
-//! transcription API over `wasi:http/outgoing-handler`.
+//! `x-stt-secret-openai_api_key` request header (absent when the user set
+//! none) and the model in the transcribe body, and the component forwards
+//! audio to the OpenAI transcription API — or to whatever OpenAI-compatible
+//! endpoint the `base_url` option names — over `wasi:http/outgoing-handler`.
 //!
 //! The `wasi:http` handler compiles only for `wasm32`; the pure helpers
-//! (`encode_wav`, `build_multipart`, `parse_base`, `parse_transcript`) build for
-//! the host too, so they are unit-tested natively while the component as a whole
-//! is exercised by the wasmtime harness in `tests/`.
+//! (`encode_wav`, `build_multipart`, `parse_base`, `resolve_model`,
+//! `parse_transcript`) build for the host too, so they are unit-tested natively
+//! while the component as a whole is exercised by the wasmtime harness in
+//! `tests/`.
 
 // Casts are intentional in audio/WAV encoding; doc lint trips on brand names.
 #![allow(clippy::cast_possible_truncation, clippy::doc_markdown)]
@@ -21,17 +23,78 @@
 // `pub` so the non-test host build that backs the integration harness does not
 // flag them as dead code (the wasm handler that calls them is cfg'd out there).
 
-/// Split a base URL into `(is_https, authority)` where authority is
-/// `host[:port]`. A bare host (no scheme) is treated as HTTPS.
+/// Split a base URL into `(is_https, authority, path_prefix)`, where authority
+/// is `host[:port]` and the prefix is the path the endpoint paths hang off.
+///
+/// `base_url` means what it means in every OpenAI SDK, so it carries the API
+/// version: `https://api.groq.com/openai/v1` yields the prefix `/openai/v1` and
+/// a request to `/openai/v1/audio/transcriptions`. An origin-only value gets the
+/// `/v1` prefix OpenAI itself serves, so a value without a path still resolves.
+///
+/// The daemon canonicalizes the value before injecting it (lowercase scheme, no
+/// userinfo, no trailing slash, no query or fragment), so splitting the
+/// authority at the first `/` is the whole of the work. A bare host (no scheme)
+/// cannot reach production but is treated as HTTPS rather than folded into the
+/// authority.
 #[must_use]
-pub fn parse_base(base: &str) -> (bool, String) {
-    if let Some(rest) = base.strip_prefix("https://") {
-        (true, rest.trim_end_matches('/').to_string())
+pub fn parse_base(base: &str) -> (bool, String, String) {
+    let (https, rest) = if let Some(rest) = base.strip_prefix("https://") {
+        (true, rest)
     } else if let Some(rest) = base.strip_prefix("http://") {
-        (false, rest.trim_end_matches('/').to_string())
+        (false, rest)
     } else {
-        (true, base.trim_end_matches('/').to_string())
+        (true, base)
+    };
+    let rest = rest.trim_end_matches('/');
+    let (authority, prefix) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (rest, "/v1".to_string()),
+    };
+    (https, authority.to_string(), prefix)
+}
+
+/// Endpoint used when the user overrides nothing. SDK-style, so it carries the
+/// API version; its host must stay in step with [`OPENAI_HOST`].
+pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Host of OpenAI's own API — the one endpoint known to require a key.
+pub const OPENAI_HOST: &str = "api.openai.com";
+
+/// Whether a request to `base_url` is worth refusing without an API key.
+///
+/// OpenAI's own API always needs one, and a keyless request there earns a 401
+/// the user has to decode; naming the missing setting is more useful. Any other
+/// endpoint may authenticate however it likes — a local server typically not at
+/// all — so the component sends what it has and lets the server decide.
+#[must_use]
+pub fn needs_api_key(base_url: &str) -> bool {
+    let (_, authority, _) = parse_base(base_url);
+    // Port-stripping is deliberately naive: it only has to be right for a match
+    // against a known hostname, and a mangled IPv6 literal simply won't match.
+    let host = authority.split(':').next().unwrap_or_default();
+    host.eq_ignore_ascii_case(OPENAI_HOST)
+}
+
+/// Wire name of the manifest's placeholder model entry: the user is running a
+/// model this manifest does not list, on whatever server `base_url` points at.
+pub const CUSTOM_MODEL: &str = "other";
+
+/// Resolve the model name to send upstream.
+///
+/// A listed model passes through unchanged. [`CUSTOM_MODEL`] resolves to the
+/// `custom_model` option instead, so an OpenAI-compatible server can serve a
+/// model this manifest never enumerates. Returns `None` when the placeholder is
+/// selected and no custom name is set — the caller turns that into a user-facing
+/// error, because `other` is not a name any server serves.
+#[must_use]
+pub fn resolve_model(selected: &str, custom: Option<&str>) -> Option<String> {
+    if selected != CUSTOM_MODEL {
+        return Some(selected.to_string());
     }
+    custom
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(String::from)
 }
 
 /// Extract the transcript from an OpenAI transcription response (the `text`
@@ -104,7 +167,10 @@ pub fn build_multipart(boundary: &str, model: &str, language: Option<&str>, wav:
 // ── wasi:http component (wasm32 only) ───────────────────────────────────────
 #[cfg(target_arch = "wasm32")]
 mod component {
-    use super::{build_multipart, encode_wav, parse_base, parse_transcript};
+    use super::{
+        DEFAULT_BASE_URL, build_multipart, encode_wav, needs_api_key, parse_base, parse_transcript,
+        resolve_model,
+    };
 
     use wasi::exports::http::incoming_handler::Guest;
     use wasi::http::types::{
@@ -153,7 +219,17 @@ mod component {
     /// the audio body, forward to OpenAI, and return the transcription.
     fn transcribe(request: &IncomingRequest) -> (u16, Vec<u8>) {
         let entries = request.headers().entries();
-        let Some(api_key) = header(&entries, "x-stt-secret-openai_api_key") else {
+        // Read the configurable base URL from the daemon-injected header, falling
+        // back to the default OpenAI API endpoint. The default carries `/v1` for
+        // the same reason a user-set value does: it is an SDK-style base URL.
+        let base_url = header(&entries, "x-stt-option-base_url")
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        // The key is optional: a self-hosted endpoint usually wants no
+        // `authorization` header at all. Against OpenAI itself a missing key is
+        // still worth naming, since the alternative is an opaque 401.
+        let api_key =
+            header(&entries, "x-stt-secret-openai_api_key").filter(|k| !k.trim().is_empty());
+        if api_key.is_none() && needs_api_key(&base_url) {
             // Include a human-readable `detail` that the daemon surfaces to the user.
             return (
                 400,
@@ -163,12 +239,21 @@ mod component {
                     "detail": "OpenAI API key not set. Add it in Settings \u{2192} Models \u{2192} OpenAI.",
                 })),
             );
+        }
+        // The manifest's `other` entry carries no name of its own; the model the
+        // server actually serves comes from the `custom_model` option.
+        let selected = header(&entries, "x-stt-model").unwrap_or_else(|| "whisper-1".to_string());
+        let custom = header(&entries, "x-stt-option-custom_model");
+        let Some(model) = resolve_model(&selected, custom.as_deref()) else {
+            return (
+                400,
+                to_vec(&serde_json::json!({
+                    "status": "error",
+                    "message": "missing_option_custom_model",
+                    "detail": "Custom model name not set. Add it in Settings \u{2192} Models \u{2192} OpenAI, or pick a listed model.",
+                })),
+            );
         };
-        // Read the configurable base URL from the daemon-injected header, falling
-        // back to the default OpenAI API endpoint.
-        let base_url = header(&entries, "x-stt-option-base_url")
-            .unwrap_or_else(|| "https://api.openai.com".to_string());
-        let model = header(&entries, "x-stt-model").unwrap_or_else(|| "whisper-1".to_string());
 
         let Ok(body) = request.consume() else {
             return err(400, "no_body");
@@ -202,7 +287,14 @@ mod component {
             Some(code) => Some(code),
         };
 
-        match call_openai(&base_url, &api_key, &model, language, &audio, sample_rate) {
+        match call_openai(
+            &base_url,
+            api_key.as_deref(),
+            &model,
+            language,
+            &audio,
+            sample_rate,
+        ) {
             Ok(text) => (
                 200,
                 to_vec(&serde_json::json!({ "status": "success", "transcription": text })),
@@ -219,7 +311,7 @@ mod component {
     /// Send the audio to OpenAI's transcription API and return the text.
     fn call_openai(
         base_url: &str,
-        api_key: &str,
+        api_key: Option<&str>,
         model: &str,
         language: Option<&str>,
         audio: &[f32],
@@ -228,13 +320,17 @@ mod component {
         let wav = encode_wav(audio, sample_rate);
         let boundary = "----superstt7MA4YWxkTrZu0gW";
         let multipart = build_multipart(boundary, model, language, &wav);
-        let (https, authority) = parse_base(base_url);
+        let (https, authority, prefix) = parse_base(base_url);
         let scheme = if https { Scheme::Https } else { Scheme::Http };
 
         let headers = Fields::new();
-        headers
-            .append("authorization", format!("Bearer {api_key}").as_bytes())
-            .map_err(|e| format!("header: {e:?}"))?;
+        // No key means no `authorization` header — an empty `Bearer` is worse
+        // than none to a server that does not authenticate.
+        if let Some(key) = api_key {
+            headers
+                .append("authorization", format!("Bearer {key}").as_bytes())
+                .map_err(|e| format!("header: {e:?}"))?;
+        }
         headers
             .append(
                 "content-type",
@@ -253,7 +349,7 @@ mod component {
             .set_authority(Some(&authority))
             .map_err(|()| "set_authority")?;
         request
-            .set_path_with_query(Some("/v1/audio/transcriptions"))
+            .set_path_with_query(Some(&format!("{prefix}/audio/transcriptions")))
             .map_err(|()| "set_path")?;
 
         // Obtain the body handle, start the request, then stream the body — the
@@ -362,23 +458,136 @@ mod component {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_multipart, encode_wav, parse_base, parse_transcript};
+    use super::{
+        DEFAULT_BASE_URL, build_multipart, encode_wav, needs_api_key, parse_base, parse_transcript,
+        resolve_model,
+    };
 
+    /// The canonical values the daemon injects: scheme present, no trailing
+    /// slash, path preserved verbatim.
     #[test]
-    fn parse_base_splits_scheme_and_authority() {
+    fn parse_base_splits_scheme_authority_and_path() {
+        assert_eq!(
+            parse_base("https://api.openai.com/v1"),
+            (true, "api.openai.com".to_string(), "/v1".to_string())
+        );
+        // A multi-segment prefix stays whole — the authority stops at the first
+        // `/`, which is what `set_authority` will accept.
+        assert_eq!(
+            parse_base("https://api.groq.com/openai/v1"),
+            (true, "api.groq.com".to_string(), "/openai/v1".to_string())
+        );
+        assert_eq!(
+            parse_base("http://localhost:4000/v1"),
+            (false, "localhost:4000".to_string(), "/v1".to_string())
+        );
+        // A bracketed IPv6 authority survives: no `/` inside the brackets.
+        assert_eq!(
+            parse_base("http://[::1]:8080/v1"),
+            (false, "[::1]:8080".to_string(), "/v1".to_string())
+        );
+    }
+
+    /// An origin-only value gets OpenAI's own `/v1`, so every value that worked
+    /// before this split keeps working.
+    #[test]
+    fn parse_base_defaults_an_empty_path_to_v1() {
         assert_eq!(
             parse_base("https://api.openai.com"),
-            (true, "api.openai.com".to_string())
+            (true, "api.openai.com".to_string(), "/v1".to_string())
         );
         assert_eq!(
-            parse_base("http://localhost:8080/"),
-            (false, "localhost:8080".to_string())
+            parse_base("http://localhost:8080"),
+            (false, "localhost:8080".to_string(), "/v1".to_string())
         );
-        // A bare host (no scheme) defaults to HTTPS.
+    }
+
+    /// Defensive branches for values the daemon's canonicalization rules out.
+    #[test]
+    fn parse_base_tolerates_non_canonical_values() {
+        // A bare host (no scheme) defaults to HTTPS rather than becoming part of
+        // the authority.
         assert_eq!(
             parse_base("api.openai.com"),
-            (true, "api.openai.com".to_string())
+            (true, "api.openai.com".to_string(), "/v1".to_string())
         );
+        // A trailing slash is not a path prefix.
+        assert_eq!(
+            parse_base("http://localhost:8080/"),
+            (false, "localhost:8080".to_string(), "/v1".to_string())
+        );
+        assert_eq!(
+            parse_base("https://gateway.example.com/v1/"),
+            (true, "gateway.example.com".to_string(), "/v1".to_string())
+        );
+    }
+
+    /// OpenAI's own API is the one endpoint the component refuses to call
+    /// keyless, so the missing setting is named instead of a 401 being relayed.
+    #[test]
+    fn needs_api_key_only_for_openais_own_api() {
+        assert!(needs_api_key(DEFAULT_BASE_URL));
+        assert!(needs_api_key("https://api.openai.com"));
+        // Canonicalization lowercases the scheme, not the host.
+        assert!(needs_api_key("https://API.OpenAI.com/v1"));
+        assert!(needs_api_key("https://api.openai.com:443/v1"));
+    }
+
+    /// Anywhere else authenticates on its own terms — commonly not at all.
+    #[test]
+    fn needs_api_key_is_false_for_other_endpoints() {
+        assert!(!needs_api_key("http://localhost:8000/v1"));
+        assert!(!needs_api_key("http://[::1]:8080/v1"));
+        assert!(!needs_api_key("https://api.groq.com/openai/v1"));
+        // A lookalike host is a different host.
+        assert!(!needs_api_key("https://api.openai.com.evil.test/v1"));
+        assert!(!needs_api_key(
+            "https://proxy.example.com/api.openai.com/v1"
+        ));
+    }
+
+    /// The default endpoint is the host `needs_api_key` recognizes; a rename of
+    /// one without the other would silently drop the keyless refusal.
+    #[test]
+    fn default_base_url_targets_the_known_openai_host() {
+        let (https, authority, prefix) = parse_base(DEFAULT_BASE_URL);
+        assert!(https);
+        assert_eq!(authority, super::OPENAI_HOST);
+        assert_eq!(prefix, "/v1");
+    }
+
+    /// A listed model is sent as-is, whether or not a custom name is configured
+    /// — the option only speaks for the `other` entry.
+    #[test]
+    fn resolve_model_passes_listed_models_through() {
+        assert_eq!(resolve_model("whisper-1", None).unwrap(), "whisper-1");
+        assert_eq!(
+            resolve_model("gpt-4o-transcribe", Some("ignored")).unwrap(),
+            "gpt-4o-transcribe"
+        );
+    }
+
+    /// `other` is a placeholder, so it resolves to the configured name.
+    #[test]
+    fn resolve_model_substitutes_the_custom_name() {
+        assert_eq!(
+            resolve_model("other", Some("Systran/faster-whisper-large-v3")).unwrap(),
+            "Systran/faster-whisper-large-v3"
+        );
+        // Surrounding whitespace from a pasted value is not part of the name.
+        assert_eq!(
+            resolve_model("other", Some("  my-model \n")).unwrap(),
+            "my-model"
+        );
+    }
+
+    /// `other` with nothing configured has no name to send — the caller reports
+    /// that rather than asking the server for a model called `other`.
+    #[test]
+    fn resolve_model_rejects_an_unset_custom_name() {
+        assert!(resolve_model("other", None).is_none());
+        assert!(resolve_model("other", Some("")).is_none());
+        assert!(resolve_model("other", Some("   ")).is_none());
     }
 
     #[test]

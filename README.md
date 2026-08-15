@@ -24,11 +24,26 @@ Chosen by `name` when Super STT loads the backend. These are **online** models: 
 audio to OpenAI and need an OpenAI API key (set in the app); no local GPU or weights are
 involved.
 
-| Model (`name`)           | Provider | Type   | Languages | Requires        |
-| ------------------------ | -------- | ------ | --------- | --------------- |
-| `whisper-1`              | openai   | online | en        | OpenAI API key  |
-| `gpt-4o-transcribe`      | openai   | online | en        | OpenAI API key  |
-| `gpt-4o-mini-transcribe` | openai   | online | en        | OpenAI API key  |
+| Model (`name`)           | Provider | Type   | Languages | Requires                       |
+| ------------------------ | -------- | ------ | --------- | ------------------------------ |
+| `whisper-1`              | openai   | online | en        | OpenAI API key                 |
+| `gpt-4o-transcribe`      | openai   | online | en        | OpenAI API key                 |
+| `gpt-4o-mini-transcribe` | openai   | online | en        | OpenAI API key                 |
+| `other`                  | openai   | online | en        | **Custom model name**          |
+
+`other` is a placeholder for a model this backend does not list — one served by
+an OpenAI-compatible endpoint. Set **Custom model name** to the name that server
+expects (e.g. `Systran/faster-whisper-large-v3`) and it is sent instead of
+`other`; point **API base URL** at the server, including the API version
+(`http://localhost:8000/v1`). Selecting `other` without a custom model name is an
+error rather than a request for a model called `other`. Both settings are ignored
+by the listed OpenAI models.
+
+The **OpenAI API key** is optional. It is required to reach `api.openai.com` —
+requests there are refused without one, since they can only come back 401 — but a
+self-hosted or gateway endpoint set through **API base URL** is called with no
+`Authorization` header at all when no key is set. Set a key and it is sent as
+`Bearer` to whatever endpoint is configured.
 
 ## What's in here
 
