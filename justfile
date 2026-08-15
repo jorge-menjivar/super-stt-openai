@@ -10,6 +10,15 @@ default: build-component
 build-component *args:
     cargo build --release --locked --target wasm32-wasip2 {{ args }}
 
+# Build, then copy the component to the entrypoint name `backend.toml` declares,
+# so this directory can be installed with the daemon's Import-from-dir path.
+# Cargo names the artifact after the crate; the release workflow renames it the
+# same way when attaching it to a GitHub release, so a local install and a
+# published one stage the same bytes under the same name.
+stage: build-component
+    cp target/wasm32-wasip2/release/super_stt_backend_openai.wasm openai.wasm
+    @echo "staged openai.wasm — this directory is now installable with Import from dir"
+
 # Lint the shipped component on its real target (wasm32-wasip2). The host build
 # only sees the pure helpers (the wasi handler is cfg'd out), so the component's
 # own code is linted here. Gating: `-D warnings`.
