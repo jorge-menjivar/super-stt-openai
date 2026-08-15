@@ -23,13 +23,19 @@
 [[secrets]]
     name = "openai_api_key"
     label = "OpenAI API key"
-    description = "Used to authenticate requests to api.openai.com."
-    required = true
+    description = "Used to authenticate requests to api.openai.com. Required there; optional when the API base URL points at a server that authenticates differently or not at all, in which case no authorization header is sent."
+    required = false
 
 [[options]]
     name = "base_url"
     label = "API base URL"
-    description = "Override the API base URL, e.g. for a proxy or gateway. The host you set here is automatically authorized for network egress (origin form, e.g. https://gateway.example.com)."
+    description = "Override the API base URL, e.g. for a proxy or gateway. Include the API version the way an OpenAI SDK does, e.g. https://gateway.example.com/v1. The host you set here is automatically authorized for network egress. A local endpoint needs an explicit http:// scheme (a value without one is read as https) and its port; only that exact port is authorized."
+    type = "string"
+
+[[options]]
+    name = "custom_model"
+    label = "Custom model name"
+    description = "Model name to request when the \"other\" model is selected, e.g. Systran/faster-whisper-large-v3. Ignored for the listed OpenAI models. Use it with an API base URL pointing at the server that serves the model."
     type = "string"
 
 [[models]]
@@ -62,6 +68,25 @@
 
 [[models]]
     name = "gpt-4o-mini-transcribe"
+    provider = "openai"
+    multilingual = true
+    primary_language = "en"
+    supported_languages = [
+        "en", "af", "ar", "az", "be", "bg", "bs", "ca", "cs", "cy", "da", "de",
+        "el", "es", "et", "fa", "fi", "fr", "gl", "he", "hi", "hr", "hu", "hy",
+        "id", "is", "it", "ja", "kk", "kn", "ko", "lt", "lv", "mi", "mk", "mr",
+        "ms", "ne", "nl", "no", "pl", "pt", "ro", "ru", "sk", "sl", "sr", "sv",
+        "sw", "ta", "th", "tl", "tr", "uk", "ur", "vi", "zh",
+    ]
+    supported_devices = ["none"]
+
+# Placeholder for a model this manifest does not list — one served by an
+# OpenAI-compatible endpoint set through `base_url`. The name sent upstream comes
+# from the `custom_model` option; selecting this model without setting it is an
+# error. The language list matches the OpenAI models because the served model is
+# unknown here, so nothing narrower would be honest.
+[[models]]
+    name = "other"
     provider = "openai"
     multilingual = true
     primary_language = "en"
