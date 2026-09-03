@@ -1,23 +1,48 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! OpenAI speech-to-text backend as a `wasi:http` proxy component.
+//! OpenAI speech-to-text backend targeting the `super-stt:realtime` world.
 //!
-//! Implements the Super STT `/v1` backend contract
-//! (`docs/protocol/backend/contract.md`) by exporting
-//! `wasi:http/incoming-handler` and dispatching on method + path. The
-//! component is stateless: the daemon injects the API key as the
-//! `x-stt-secret-openai_api_key` request header (absent when the user set
-//! none) and the model in the transcribe body, and the component forwards
-//! audio to the OpenAI transcription API — or to whatever OpenAI-compatible
-//! endpoint the `base_url` option names — over `wasi:http/outgoing-handler`.
+//! The component exports both halves of that world:
 //!
-//! The `wasi:http` handler compiles only for `wasm32`; the pure helpers
-//! (`encode_wav`, `build_multipart`, `parse_base`, `resolve_model`,
-//! `parse_transcript`) build for the host too, so they are unit-tested natively
-//! while the component as a whole is exercised by the wasmtime harness in
-//! `tests/`.
+//! * `wasi:http/incoming-handler` — the Super STT `/v1` batch contract
+//!   (`docs/protocol/backend/contract.md`), dispatching on method + path. This
+//!   path is stateless: the daemon injects the API key as the
+//!   `x-stt-secret-openai_api_key` request header (absent when the user set
+//!   none) and the model in the transcribe body, and the component forwards
+//!   audio to the OpenAI transcription API — or to whatever OpenAI-compatible
+//!   endpoint the `base_url` option names — over
+//!   `wasi:http/outgoing-handler`.
+//! * `super-stt:realtime/ws-server` — the realtime WebSocket session handler.
+//!   It bridges a consumer WebSocket to OpenAI's realtime transcription API
+//!   over the daemon-implemented `super-stt:realtime/ws` import.
+//!
+//! The `wit-bindgen` / `wasi:http` handler is **wasm-only**, so it lives behind
+//! `#[cfg(target_arch = "wasm32")]` in [`mod@component`]. The pure audio,
+//! request-shaping, and realtime-payload helpers stay host-compiled here and
+//! are unit-tested natively (a pure-wasm crate could not test them).
 
-// Casts are intentional in audio/WAV encoding; doc lint trips on brand names.
-#![allow(clippy::cast_possible_truncation, clippy::doc_markdown)]
+// Casts are intentional in audio/WAV encoding and resampling; doc lint trips on
+// brand names.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::doc_markdown
+)]
+
+use base64::Engine as _;
+
+#[cfg(target_arch = "wasm32")]
+mod component;
+
+/// Case-insensitive header lookup over a `(name, value)` list. Both transports
+/// read the daemon's injected `x-stt-*` context this way — the batch path off
+/// `Fields::entries()`, the realtime path off the `ws-server.handle` argument.
+#[must_use]
+pub fn header(entries: &[(String, Vec<u8>)], want: &str) -> Option<String> {
+    entries
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(want))
+        .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+}
 
 // ── pure helpers (host-testable) ────────────────────────────────────────────
 // `pub` so the non-test host build that backs the integration harness does not
@@ -79,16 +104,29 @@ pub fn needs_api_key(base_url: &str) -> bool {
 /// model this manifest does not list, on whatever server `base_url` points at.
 pub const CUSTOM_MODEL: &str = "other";
 
+/// The realtime counterpart of [`CUSTOM_MODEL`] — the same placeholder on the
+/// WebSocket transport. A manifest entry is identified by its name, so the two
+/// transports need two entries; both read the same `custom_model` option.
+pub const CUSTOM_MODEL_REALTIME: &str = "other-realtime";
+
+/// Whether `name` is a placeholder standing in for the `custom_model` option
+/// rather than a name a server serves.
+#[must_use]
+pub fn is_custom_placeholder(name: &str) -> bool {
+    name == CUSTOM_MODEL || name == CUSTOM_MODEL_REALTIME
+}
+
 /// Resolve the model name to send upstream.
 ///
-/// A listed model passes through unchanged. [`CUSTOM_MODEL`] resolves to the
-/// `custom_model` option instead, so an OpenAI-compatible server can serve a
-/// model this manifest never enumerates. Returns `None` when the placeholder is
-/// selected and no custom name is set — the caller turns that into a user-facing
-/// error, because `other` is not a name any server serves.
+/// A listed model passes through unchanged. [`CUSTOM_MODEL`] and
+/// [`CUSTOM_MODEL_REALTIME`] resolve to the `custom_model` option instead, so an
+/// OpenAI-compatible server can serve a model this manifest never enumerates.
+/// Returns `None` when a placeholder is selected and no custom name is set — the
+/// caller turns that into a user-facing error, because `other` is not a name any
+/// server serves.
 #[must_use]
 pub fn resolve_model(selected: &str, custom: Option<&str>) -> Option<String> {
-    if selected != CUSTOM_MODEL {
+    if !is_custom_placeholder(selected) {
         return Some(selected.to_string());
     }
     custom
@@ -213,323 +251,232 @@ pub fn build_multipart(boundary: &str, model: &str, language: Option<&str>, wav:
     body
 }
 
-// ── wasi:http component (wasm32 only) ───────────────────────────────────────
-#[cfg(target_arch = "wasm32")]
-mod component {
-    use super::{
-        DEFAULT_BASE_URL, build_multipart, encode_wav, endpoint_url, needs_api_key, parse_base,
-        parse_transcript, resolve_model, unreachable_detail, upstream_status_detail,
+// ── realtime helpers (pure; host-compiled + unit-tested) ────────────────────
+
+/// The only sample rate OpenAI's realtime API accepts for `audio/pcm`: 24 kHz,
+/// mono, 16-bit little-endian. The consumer declares its own rate in the `start`
+/// frame (16 kHz, typically), so the session resamples on the way upstream —
+/// see [`Resampler`].
+pub const REALTIME_SAMPLE_RATE: u32 = 24000;
+
+/// OpenAI's realtime transcription model, and the model a session assumes when
+/// the daemon injects no `x-stt-model`. It is also the one model that takes a
+/// `languages` list where the others take a singular `language` — sending both
+/// spellings is an error, so [`session_update_json`] picks by name.
+pub const LIVE_TRANSCRIBE_MODEL: &str = "gpt-live-transcribe";
+
+/// Least audio OpenAI will commit as a turn — 100 ms, which at
+/// [`REALTIME_SAMPLE_RATE`] and 2 bytes per sample is 4800 bytes. A shorter
+/// recording is answered with an empty transcript rather than relaying the
+/// upstream's `input_audio_buffer_commit_empty`, which says nothing to a user
+/// who simply tapped the key.
+pub const MIN_COMMIT_BYTES: usize = 4800;
+
+/// The realtime WebSocket endpoint for a given API base URL.
+///
+/// `base_url` is SDK-style and carries the API version, exactly as the batch
+/// path reads it (see [`parse_base`]), so `https://api.openai.com/v1` yields
+/// `wss://api.openai.com/v1/realtime?intent=transcription`. The model is not in
+/// the URL — it is named in the `session.update` the session sends next.
+#[must_use]
+pub fn realtime_ws_url(base_url: &str) -> String {
+    let (https, authority, prefix) = parse_base(base_url);
+    let scheme = if https { "wss" } else { "ws" };
+    format!("{scheme}://{authority}{prefix}/realtime?intent=transcription")
+}
+
+/// Detail for a realtime session whose upstream WebSocket never opened.
+///
+/// The mirror of [`unreachable_detail`] for the WebSocket transport: it names
+/// the endpoint, and over `wss` names the scheme mismatch that produces this
+/// most often, since a base URL without an explicit scheme is read as secure.
+#[must_use]
+pub fn ws_unreachable_detail(endpoint: &str, secure: bool, cause: &str) -> String {
+    let hint = if secure {
+        " Check the server is running and reachable on that port, and that it accepts wss — a plaintext server reached over wss fails exactly this way."
+    } else {
+        " Check the server is running and reachable on that port."
     };
+    format!("Could not reach {endpoint} ({cause}).{hint}")
+}
 
-    use wasi::exports::http::incoming_handler::Guest;
-    use wasi::http::types::{
-        Fields, IncomingBody, IncomingRequest, Method, OutgoingBody, OutgoingRequest,
-        OutgoingResponse, ResponseOutparam, Scheme,
-    };
-    use wasi::io::streams::StreamError;
-
-    struct Component;
-
-    impl Guest for Component {
-        fn handle(request: IncomingRequest, outparam: ResponseOutparam) {
-            let (status, body) = route(&request);
-            send_response(outparam, status, &body);
+/// The `session.update` that configures a transcription-only realtime session.
+///
+/// Turn detection is off: the consumer decides when its turn ends (a `stop`
+/// frame or a close), and the session commits the buffer once at that point.
+#[must_use]
+pub fn session_update_json(model: &str, language: Option<&str>) -> String {
+    let mut transcription = serde_json::json!({ "model": model });
+    if let Some(code) = language {
+        if model == LIVE_TRANSCRIBE_MODEL {
+            transcription["languages"] = serde_json::json!([code]);
+        } else {
+            transcription["language"] = serde_json::Value::String(code.to_string());
         }
     }
+    serde_json::json!({
+        "type": "session.update",
+        "session": {
+            "type": "transcription",
+            "audio": {
+                "input": {
+                    "format": { "type": "audio/pcm", "rate": REALTIME_SAMPLE_RATE },
+                    "transcription": transcription,
+                    "turn_detection": serde_json::Value::Null,
+                },
+            },
+        },
+    })
+    .to_string()
+}
 
-    wasi::http::proxy::export!(Component);
+/// `input_audio_buffer.append` payload carrying base64-standard PCM (s16le mono
+/// at [`REALTIME_SAMPLE_RATE`]).
+#[must_use]
+pub fn audio_append_json(pcm: &[u8]) -> String {
+    let audio = base64::engine::general_purpose::STANDARD.encode(pcm);
+    serde_json::json!({ "type": "input_audio_buffer.append", "audio": audio }).to_string()
+}
 
-    /// Dispatch a `/v1` request to its handler, returning `(status, json_bytes)`.
-    fn route(request: &IncomingRequest) -> (u16, Vec<u8>) {
-        let method = request.method();
-        let full = request.path_with_query().unwrap_or_default();
-        let path = full.split('?').next().unwrap_or("");
-
-        match (&method, path) {
-            (Method::Get, "/v1/ping") => ok(&serde_json::json!({
-                "status": "success", "message": "pong"
-            })),
-            (Method::Get, "/v1/status") => ok(&serde_json::json!({
-                "status": "success", "state": "ready", "device": "cpu"
-            })),
-            (Method::Post, "/v1/load") => (
-                202,
-                to_vec(&serde_json::json!({ "status": "success", "message": "Loading started" })),
-            ),
-            (Method::Post, "/v1/cancel") => ok(&serde_json::json!({
-                "status": "success", "message": "Cancelled"
-            })),
-            (Method::Post, "/v1/transcribe") => transcribe(request),
-            _ => err(404, "not_found"),
-        }
+/// Parse the consumer's `start` frame: `{"type":"start","sample_rate":N,
+/// "language":"xx"}`. Requires `type == "start"`; `sample_rate` defaults to
+/// 16000; `language` is optional, and the reserved `auto` means "no language"
+/// so the model detects it, matching the batch path.
+///
+/// # Errors
+/// Returns an error string when the JSON is invalid or `type != "start"`.
+pub fn parse_start(s: &str) -> Result<(u32, Option<String>), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(s).map_err(|_| "invalid start frame".to_string())?;
+    if v.get("type").and_then(serde_json::Value::as_str) != Some("start") {
+        return Err("invalid start frame".to_string());
     }
-
-    /// Handle `POST /v1/transcribe`: read the injected secret/option headers and
-    /// the audio body, forward to OpenAI, and return the transcription.
-    fn transcribe(request: &IncomingRequest) -> (u16, Vec<u8>) {
-        let entries = request.headers().entries();
-        // Read the configurable base URL from the daemon-injected header, falling
-        // back to the default OpenAI API endpoint. The default carries `/v1` for
-        // the same reason a user-set value does: it is an SDK-style base URL.
-        let base_url = header(&entries, "x-stt-option-base_url")
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        // The key is optional: a self-hosted endpoint usually wants no
-        // `authorization` header at all. Against OpenAI itself a missing key is
-        // still worth naming, since the alternative is an opaque 401.
-        let api_key =
-            header(&entries, "x-stt-secret-openai_api_key").filter(|k| !k.trim().is_empty());
-        if api_key.is_none() && needs_api_key(&base_url) {
-            // Include a human-readable `detail` that the daemon surfaces to the user.
-            return (
-                400,
-                to_vec(&serde_json::json!({
-                    "status": "error",
-                    "message": "missing_secret_openai_api_key",
-                    "detail": "OpenAI API key not set. Add it in Settings \u{2192} Models \u{2192} OpenAI.",
-                })),
-            );
-        }
-        // The manifest's `other` entry carries no name of its own; the model the
-        // server actually serves comes from the `custom_model` option.
-        let selected = header(&entries, "x-stt-model").unwrap_or_else(|| "whisper-1".to_string());
-        let custom = header(&entries, "x-stt-option-custom_model");
-        let Some(model) = resolve_model(&selected, custom.as_deref()) else {
-            return (
-                400,
-                to_vec(&serde_json::json!({
-                    "status": "error",
-                    "message": "missing_option_custom_model",
-                    "detail": "Custom model name not set. Add it in Settings \u{2192} Models \u{2192} OpenAI, or pick a listed model.",
-                })),
-            );
-        };
-
-        let Ok(body) = request.consume() else {
-            return err(400, "no_body");
-        };
-        let raw = match read_all(body) {
-            Ok(r) => r,
-            Err(e) => return err(500, &e),
-        };
-        let req: serde_json::Value = match serde_json::from_slice(&raw) {
-            Ok(v) => v,
-            Err(_) => return err(400, "invalid_json"),
-        };
-
-        let Some(audio) = req.get("audio_data").and_then(|v| v.as_array()) else {
-            return err(400, "invalid_audio");
-        };
-        let audio: Vec<f32> = audio
-            .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-            .collect();
-        let sample_rate = u32::try_from(
-            req.get("sample_rate")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(16000),
-        )
+    let sample_rate = v
+        .get("sample_rate")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
         .unwrap_or(16000);
-        // OpenAI auto-detects when `language` is omitted, so the reserved `auto`
-        // (and a missing field) map to "no language"; a specific code forwards.
-        let language = match req.get("language").and_then(|v| v.as_str()) {
-            Some("auto") | None => None,
-            Some(code) => Some(code),
-        };
+    let language = match v.get("language").and_then(serde_json::Value::as_str) {
+        Some("auto") | None => None,
+        Some(code) => Some(code.to_string()),
+    };
+    Ok((sample_rate, language))
+}
 
-        match call_openai(
-            &base_url,
-            api_key.as_deref(),
-            &model,
-            language,
-            &audio,
-            sample_rate,
-        ) {
-            Ok(text) => (
-                200,
-                to_vec(&serde_json::json!({ "status": "success", "transcription": text })),
-            ),
-            Err(detail) => (
-                502,
-                to_vec(&serde_json::json!({
-                    "status": "error", "message": "upstream_error", "detail": detail
-                })),
-            ),
-        }
-    }
-
-    /// Send the audio to OpenAI's transcription API and return the text.
-    fn call_openai(
-        base_url: &str,
-        api_key: Option<&str>,
-        model: &str,
-        language: Option<&str>,
-        audio: &[f32],
-        sample_rate: u32,
-    ) -> Result<String, String> {
-        let wav = encode_wav(audio, sample_rate);
-        let boundary = "----superstt7MA4YWxkTrZu0gW";
-        let multipart = build_multipart(boundary, model, language, &wav);
-        let (https, authority, prefix) = parse_base(base_url);
-        let scheme = if https { Scheme::Https } else { Scheme::Http };
-        let path = format!("{prefix}/audio/transcriptions");
-        // Named in every failure below: the daemon shows `detail` to the user,
-        // and this is what points them at the setting to check.
-        let endpoint = endpoint_url(https, &authority, &path);
-        // A request this backend could not even assemble means the base URL is
-        // not something a URL can be built from. Unreachable in practice — the
-        // daemon canonicalizes the value before injecting it — so it names the
-        // setting rather than trying to diagnose further.
-        let malformed = |cause: &str| {
-            format!("Could not build a request for {endpoint} ({cause}). Check the API base URL.")
-        };
-
-        let headers = Fields::new();
-        // No key means no `authorization` header — an empty `Bearer` is worse
-        // than none to a server that does not authenticate.
-        if let Some(key) = api_key {
-            headers
-                .append("authorization", format!("Bearer {key}").as_bytes())
-                .map_err(|e| malformed(&format!("header: {e:?}")))?;
-        }
-        headers
-            .append(
-                "content-type",
-                format!("multipart/form-data; boundary={boundary}").as_bytes(),
-            )
-            .map_err(|e| malformed(&format!("header: {e:?}")))?;
-
-        let request = OutgoingRequest::new(headers);
-        request
-            .set_method(&Method::Post)
-            .map_err(|()| malformed("set_method"))?;
-        request
-            .set_scheme(Some(&scheme))
-            .map_err(|()| malformed("set_scheme"))?;
-        request
-            .set_authority(Some(&authority))
-            .map_err(|()| malformed("set_authority"))?;
-        request
-            .set_path_with_query(Some(&path))
-            .map_err(|()| malformed("set_path"))?;
-
-        // Obtain the body handle, start the request, then stream the body — the
-        // canonical wasi:http outbound order.
-        //
-        // Everything from here to the response is a failure to *reach* the
-        // server. The write is the usual place a dead connection surfaces,
-        // because `handle` returns before the connection is established and the
-        // body is what first tries to use it.
-        let unreachable = |cause: &str| unreachable_detail(&endpoint, https, cause);
-        let out_body = request.body().map_err(|()| unreachable("request_body"))?;
-        let future = wasi::http::outgoing_handler::handle(request, None)
-            .map_err(|e| unreachable(&format!("{e:?}")))?;
-        write_all(&out_body, &multipart).map_err(|e| unreachable(&e))?;
-        OutgoingBody::finish(out_body, None).map_err(|e| unreachable(&format!("{e:?}")))?;
-
-        let pollable = future.subscribe();
-        pollable.block();
-        let response = future
-            .get()
-            .ok_or_else(|| unreachable("no_response"))?
-            .map_err(|()| unreachable("future_taken"))?
-            .map_err(|e| unreachable(&format!("{e:?}")))?;
-
-        let status = response.status();
-        let body = response
-            .consume()
-            .map_err(|()| format!("{endpoint} returned a response that could not be read."))?;
-        let bytes = read_all(body)
-            .map_err(|e| format!("{endpoint} returned a response that could not be read ({e})."))?;
-        if !(200..300).contains(&status) {
-            return Err(upstream_status_detail(&endpoint, status, &bytes));
-        }
-
-        // OpenAI response: { "text": "…" }
-        parse_transcript(&bytes).map_err(|e| {
-            format!("{endpoint} replied without a transcript ({e}). It may not be an OpenAI-compatible transcription endpoint.")
+/// `true` if `s` is a JSON object with `type == "stop"`.
+#[must_use]
+pub fn is_stop(s: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(s)
+        .ok()
+        .and_then(|v| {
+            v.get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(|t| t == "stop")
         })
-    }
+        .unwrap_or(false)
+}
 
-    // ── helpers ─────────────────────────────────────────────────────────────
+/// Consumer `preview` frame (incremental transcript).
+#[must_use]
+pub fn preview_json(text: &str) -> String {
+    serde_json::json!({ "type": "preview", "text": text }).to_string()
+}
 
-    fn ok(value: &serde_json::Value) -> (u16, Vec<u8>) {
-        (200, to_vec(value))
-    }
+/// Consumer `done` frame (final transcript).
+#[must_use]
+pub fn done_json(text: &str) -> String {
+    serde_json::json!({ "type": "done", "transcription": text }).to_string()
+}
 
-    fn err(status: u16, message: &str) -> (u16, Vec<u8>) {
-        (
-            status,
-            to_vec(&serde_json::json!({ "status": "error", "message": message })),
-        )
-    }
+/// Consumer `error` frame.
+#[must_use]
+pub fn error_json(msg: &str) -> String {
+    serde_json::json!({ "type": "error", "message": msg }).to_string()
+}
 
-    fn to_vec(value: &serde_json::Value) -> Vec<u8> {
-        serde_json::to_vec(value).unwrap_or_default()
-    }
+/// Linear-interpolation resampler for mono s16le PCM.
+///
+/// The consumer streams audio at whatever rate its `start` frame declared, and
+/// OpenAI's realtime API accepts only [`REALTIME_SAMPLE_RATE`], so every chunk
+/// is resampled on the way upstream. The fractional read position and the last
+/// sample of the previous chunk carry across calls, so a chunk boundary
+/// interpolates against its real neighbour instead of restarting — no click
+/// every 100 ms, and no drift over a long session.
+pub struct Resampler {
+    /// Input samples consumed per output sample.
+    step: f64,
+    /// Where the next output sample reads from, relative to the start of the
+    /// next chunk. `-1.0` addresses [`Self::prev`]; always `> -1.0`.
+    pos: f64,
+    /// Last sample of the previous chunk.
+    prev: i16,
+}
 
-    /// Case-insensitive header lookup over `Fields::entries()`.
-    fn header(entries: &[(String, Vec<u8>)], want: &str) -> Option<String> {
-        entries
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(want))
-            .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
-    }
-
-    /// Drain an incoming body to bytes.
-    fn read_all(body: IncomingBody) -> Result<Vec<u8>, String> {
-        let stream = body.stream().map_err(|()| "no_stream".to_string())?;
-        let mut out = Vec::new();
-        loop {
-            match stream.blocking_read(65536) {
-                Ok(chunk) => out.extend_from_slice(&chunk),
-                Err(StreamError::Closed) => break,
-                Err(StreamError::LastOperationFailed(_)) => return Err("read_failed".to_string()),
-            }
-        }
-        drop(stream);
-        let _ = IncomingBody::finish(body);
-        Ok(out)
-    }
-
-    /// Write all bytes to an outgoing body in ≤4096-byte flushes.
-    fn write_all(body: &OutgoingBody, data: &[u8]) -> Result<(), String> {
-        let stream = body.write().map_err(|()| "write_stream".to_string())?;
-        for chunk in data.chunks(4096) {
-            stream
-                .blocking_write_and_flush(chunk)
-                .map_err(|_| "write_failed".to_string())?;
-        }
-        drop(stream);
-        Ok(())
-    }
-
-    /// Build the response and hand it to the outparam.
-    fn send_response(outparam: ResponseOutparam, status: u16, body_bytes: &[u8]) {
-        let headers = Fields::new();
-        let _ = headers.append("content-type", b"application/json");
-        let response = OutgoingResponse::new(headers);
-        let _ = response.set_status_code(status);
-        let Ok(body) = response.body() else {
-            ResponseOutparam::set(outparam, Ok(response));
-            return;
+impl Resampler {
+    /// A resampler from `from` Hz to `to` Hz. A zero rate (which the `start`
+    /// frame cannot produce) is treated as pass-through rather than a panic.
+    #[must_use]
+    pub fn new(from: u32, to: u32) -> Self {
+        let step = if from == 0 || to == 0 {
+            1.0
+        } else {
+            f64::from(from) / f64::from(to)
         };
-        ResponseOutparam::set(outparam, Ok(response));
-        if let Ok(stream) = body.write() {
-            for chunk in body_bytes.chunks(4096) {
-                let _ = stream.blocking_write_and_flush(chunk);
-            }
-            drop(stream);
+        Self {
+            step,
+            pos: 0.0,
+            prev: 0,
         }
-        let _ = OutgoingBody::finish(body, None);
+    }
+
+    /// Resample one chunk of s16le PCM. A trailing odd byte is dropped — the
+    /// consumer frames whole samples, so there is never one to keep.
+    pub fn process(&mut self, pcm: &[u8]) -> Vec<u8> {
+        let count = pcm.len() / 2;
+        if count == 0 {
+            return Vec::new();
+        }
+        // A negative index reads the previous chunk's last sample; an index past
+        // the end clamps, which only happens with a zero fraction (weight 0).
+        let prev = self.prev;
+        let at = |index: isize| -> f64 {
+            let Ok(index) = usize::try_from(index) else {
+                return f64::from(prev);
+            };
+            let index = index.min(count - 1);
+            f64::from(i16::from_le_bytes([pcm[index * 2], pcm[index * 2 + 1]]))
+        };
+
+        let last = (count - 1) as f64;
+        let mut out = Vec::new();
+        while self.pos <= last {
+            let base = self.pos.floor();
+            let frac = self.pos - base;
+            let index = base as isize;
+            let value = at(index) + (at(index + 1) - at(index)) * frac;
+            out.extend_from_slice(&(value.round() as i16).to_le_bytes());
+            self.pos += self.step;
+        }
+
+        self.prev = i16::from_le_bytes([pcm[(count - 1) * 2], pcm[(count - 1) * 2 + 1]]);
+        // Rebase onto the next chunk. The loop ran past `last`, so this stays
+        // above -1.0 and the next chunk's `prev` remains the right neighbour.
+        self.pos -= count as f64;
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_BASE_URL, build_multipart, encode_wav, endpoint_url, needs_api_key, parse_base,
-        parse_transcript, resolve_model, unreachable_detail, upstream_status_detail,
+        DEFAULT_BASE_URL, LIVE_TRANSCRIBE_MODEL, REALTIME_SAMPLE_RATE, Resampler,
+        audio_append_json, build_multipart, done_json, encode_wav, endpoint_url, error_json,
+        is_stop, needs_api_key, parse_base, parse_start, parse_transcript, preview_json,
+        realtime_ws_url, resolve_model, session_update_json, unreachable_detail,
+        upstream_status_detail, ws_unreachable_detail,
     };
+    use base64::Engine as _;
 
     /// The canonical values the daemon injects: scheme present, no trailing
     /// slash, path preserved verbatim.
@@ -768,5 +715,211 @@ mod tests {
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("name=\"language\""));
         assert!(text.contains("\r\n\r\nes\r\n"));
+    }
+
+    // ── realtime helpers ────────────────────────────────────────────────────
+
+    /// The realtime endpoint hangs off the same SDK-style base URL the batch
+    /// path uses, so a gateway's API version prefix survives.
+    #[test]
+    fn realtime_ws_url_maps_the_scheme_and_keeps_the_api_version() {
+        assert_eq!(
+            realtime_ws_url(DEFAULT_BASE_URL),
+            "wss://api.openai.com/v1/realtime?intent=transcription"
+        );
+        assert_eq!(
+            realtime_ws_url("http://localhost:8000/v1"),
+            "ws://localhost:8000/v1/realtime?intent=transcription"
+        );
+        assert_eq!(
+            realtime_ws_url("https://api.groq.com/openai/v1"),
+            "wss://api.groq.com/openai/v1/realtime?intent=transcription"
+        );
+        // An origin-only value gets the `/v1` OpenAI itself serves.
+        assert_eq!(
+            realtime_ws_url("https://gateway.example.com"),
+            "wss://gateway.example.com/v1/realtime?intent=transcription"
+        );
+    }
+
+    /// The WebSocket mirror of `unreachable_detail`: the endpoint always, and
+    /// the scheme trap only where it can apply.
+    #[test]
+    fn ws_unreachable_detail_names_the_endpoint_and_the_scheme_trap() {
+        let secure = ws_unreachable_detail("wss://gw.local/v1/realtime", true, "connect failed");
+        assert!(secure.contains("wss://gw.local/v1/realtime"), "{secure}");
+        assert!(secure.contains("connect failed"), "{secure}");
+        assert!(secure.contains("plaintext server"), "{secure}");
+
+        let plain = ws_unreachable_detail("ws://gw.local/v1/realtime", false, "connect failed");
+        assert!(plain.contains("ws://gw.local/v1/realtime"), "{plain}");
+        assert!(!plain.contains("plaintext server"), "{plain}");
+    }
+
+    #[test]
+    fn parse_start_reads_the_rate_and_language() {
+        assert_eq!(
+            parse_start(r#"{"type":"start","sample_rate":24000,"language":"fr"}"#).unwrap(),
+            (24000, Some("fr".to_string()))
+        );
+        // Defaults the rate to 16000; language optional.
+        assert_eq!(parse_start(r#"{"type":"start"}"#).unwrap(), (16000, None));
+        // `auto` means "let the model detect it", as on the batch path.
+        assert_eq!(
+            parse_start(r#"{"type":"start","language":"auto"}"#).unwrap(),
+            (16000, None)
+        );
+        // A zero rate would divide by zero downstream; it is not a rate.
+        assert_eq!(
+            parse_start(r#"{"type":"start","sample_rate":0}"#).unwrap(),
+            (16000, None)
+        );
+        assert!(parse_start(r#"{"type":"stop"}"#).is_err());
+        assert!(parse_start("not json").is_err());
+    }
+
+    #[test]
+    fn is_stop_detects_stop_frames() {
+        assert!(is_stop(r#"{"type":"stop"}"#));
+        assert!(!is_stop(r#"{"type":"start"}"#));
+        assert!(!is_stop("garbage"));
+    }
+
+    /// The session is transcription-only, at the one rate the API accepts, with
+    /// turn detection off so the commit is ours to send.
+    #[test]
+    fn session_update_json_configures_a_transcription_session() {
+        let v: serde_json::Value =
+            serde_json::from_str(&session_update_json("whisper-1", Some("es"))).unwrap();
+        assert_eq!(v["type"], "session.update");
+        assert_eq!(v["session"]["type"], "transcription");
+        let input = &v["session"]["audio"]["input"];
+        assert_eq!(input["format"]["type"], "audio/pcm");
+        assert_eq!(input["format"]["rate"], REALTIME_SAMPLE_RATE);
+        assert_eq!(input["transcription"]["model"], "whisper-1");
+        assert_eq!(input["transcription"]["language"], "es");
+        assert!(input["turn_detection"].is_null());
+    }
+
+    /// One model spells the language as a list. Sending both spellings is an
+    /// upstream error, so only one may ever appear.
+    #[test]
+    fn session_update_json_uses_the_plural_field_for_live_transcribe() {
+        let v: serde_json::Value =
+            serde_json::from_str(&session_update_json(LIVE_TRANSCRIBE_MODEL, Some("en"))).unwrap();
+        let transcription = &v["session"]["audio"]["input"]["transcription"];
+        assert_eq!(transcription["languages"][0], "en");
+        assert!(transcription["language"].is_null());
+
+        // No language at all: neither field appears, and the model detects it.
+        let v: serde_json::Value =
+            serde_json::from_str(&session_update_json(LIVE_TRANSCRIBE_MODEL, None)).unwrap();
+        let transcription = &v["session"]["audio"]["input"]["transcription"];
+        assert!(transcription["languages"].is_null());
+        assert!(transcription["language"].is_null());
+    }
+
+    #[test]
+    fn audio_append_json_carries_base64_pcm() {
+        let v: serde_json::Value = serde_json::from_str(&audio_append_json(&[1, 2, 3, 4])).unwrap();
+        assert_eq!(v["type"], "input_audio_buffer.append");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(v["audio"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn consumer_frames_carry_the_documented_shapes() {
+        let preview: serde_json::Value = serde_json::from_str(&preview_json("partial")).unwrap();
+        assert_eq!(preview["type"], "preview");
+        assert_eq!(preview["text"], "partial");
+
+        let done: serde_json::Value = serde_json::from_str(&done_json("final")).unwrap();
+        assert_eq!(done["type"], "done");
+        assert_eq!(done["transcription"], "final");
+
+        let error: serde_json::Value = serde_json::from_str(&error_json("nope")).unwrap();
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["message"], "nope");
+    }
+
+    /// Build `count` s16le samples from a function of the sample index.
+    fn pcm(count: usize, f: impl Fn(usize) -> i16) -> Vec<u8> {
+        (0..count).flat_map(|i| f(i).to_le_bytes()).collect()
+    }
+
+    /// Read s16le bytes back as samples.
+    fn samples(bytes: &[u8]) -> Vec<i16> {
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .copied()
+            .map(i16::from_le_bytes)
+            .collect()
+    }
+
+    /// 16 kHz in, 24 kHz out: half again as many samples, chunk after chunk.
+    /// The count is allowed to drift by a sample per boundary — a resampled
+    /// stream cannot land on exact chunk multiples.
+    #[test]
+    fn resampler_upsamples_16k_to_24k() {
+        let mut resampler = Resampler::new(16000, REALTIME_SAMPLE_RATE);
+        let chunk = pcm(1600, |_| 0);
+        let mut total = 0;
+        for _ in 0..4 {
+            total += samples(&resampler.process(&chunk)).len();
+        }
+        let expected = 4 * 1600 * 3 / 2;
+        assert!(
+            total.abs_diff(expected) <= 4,
+            "expected ~{expected} samples, got {total}"
+        );
+    }
+
+    /// Matching rates are a pass-through: same samples, same order.
+    #[test]
+    fn resampler_passes_matching_rates_through() {
+        let mut resampler = Resampler::new(REALTIME_SAMPLE_RATE, REALTIME_SAMPLE_RATE);
+        let input = pcm(8, |i| i16::try_from(i).unwrap() * 100);
+        assert_eq!(samples(&resampler.process(&input)), samples(&input));
+        // And again on the next chunk — the carried position does not drift.
+        assert_eq!(samples(&resampler.process(&input)), samples(&input));
+    }
+
+    /// A chunk boundary interpolates against the previous chunk's last sample,
+    /// so a rising ramp keeps rising instead of dipping back toward zero.
+    #[test]
+    fn resampler_is_continuous_across_chunks() {
+        let mut resampler = Resampler::new(16000, REALTIME_SAMPLE_RATE);
+        let first = pcm(64, |i| i16::try_from(i).unwrap() * 100);
+        let second = pcm(64, |i| i16::try_from(i + 64).unwrap() * 100);
+        let mut out = samples(&resampler.process(&first));
+        out.extend(samples(&resampler.process(&second)));
+        assert!(
+            out.windows(2).all(|w| w[1] >= w[0]),
+            "resampled ramp should be non-decreasing: {out:?}"
+        );
+        // And it spans the whole input range rather than restarting.
+        assert_eq!(*out.first().unwrap(), 0);
+        assert!(*out.last().unwrap() >= 12_600, "{:?}", out.last());
+    }
+
+    /// The realtime placeholder reads the same `custom_model` option as the
+    /// batch one, so one setting serves both transports.
+    #[test]
+    fn resolve_model_substitutes_the_custom_name_for_the_realtime_placeholder() {
+        assert_eq!(
+            resolve_model("other-realtime", Some("my-local-whisper")).unwrap(),
+            "my-local-whisper"
+        );
+        assert!(resolve_model("other-realtime", None).is_none());
+        assert!(resolve_model("other-realtime", Some("  ")).is_none());
+        // A listed realtime model is still sent as-is.
+        assert_eq!(
+            resolve_model(LIVE_TRANSCRIBE_MODEL, Some("ignored")).unwrap(),
+            LIVE_TRANSCRIBE_MODEL
+        );
     }
 }

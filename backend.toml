@@ -3,238 +3,245 @@
 # OpenAI backend configuration. See docs/protocol/backend/config.md.
 
 [backend]
-    source = "github.com/jorge-menjivar/super-stt-openai"
-    name = "OpenAI"
-    version = "0.1.1"
-    kind = "wasm"
-    entrypoint = "openai.wasm"
-    contract = "v1"
-    license = "GPL-3.0-only"
-    description = "Cloud speech-to-text via the OpenAI API."
+  id          = "app.super-stt.openai"
+  source      = "github.com/jorge-menjivar/super-stt-openai"
+  name        = "OpenAI"
+  version     = "0.1.2"
+  kind        = "wasm"
+  entrypoint  = "openai.wasm"
+  contract    = "v2"
+  license     = "GPL-3.0-only"
+  description = "Cloud speech-to-text via the OpenAI API."
 
 [assets]
-    # Filename of the wasm component attached to the GitHub release. The indexer
-    # hashes these bytes into the registry's manifest pin; must match `entrypoint`.
-    wasm = "openai.wasm"
+  # Filename of the wasm component attached to the GitHub release. The indexer
+  # hashes these bytes into the registry's manifest pin; must match `entrypoint`.
+  wasm = "openai.wasm"
 
 [network]
-    allowed_hosts = ["api.openai.com"]
+  allowed_hosts = ["api.openai.com"]
+
+[capabilities]
+  # Opts into the realtime WebSocket pair: the `super-stt:realtime/ws` import
+  # the session dials the upstream with, and the `ws-server` export the daemon
+  # hands each consumer session to. Required by the `realtime = true` models.
+  websocket = true
 
 [[secrets]]
-    name = "openai_api_key"
-    label = "OpenAI API key"
-    description = "Used to authenticate requests to api.openai.com. Required there; optional when the API base URL points at a server that authenticates differently or not at all, in which case no authorization header is sent."
-    required = false
+  name        = "openai_api_key"
+  label       = "OpenAI API key"
+  description = "Used to authenticate requests to api.openai.com. Required there; optional when the API base URL points at a server that authenticates differently or not at all, in which case no authorization header is sent."
+  required    = false
 
 [[options]]
-    name = "base_url"
-    label = "API base URL"
-    description = "Override the API base URL, e.g. for a proxy or gateway. Include the API version the way an OpenAI SDK does, e.g. https://gateway.example.com/v1. The host you set here is automatically authorized for network egress. A local endpoint needs an explicit http:// scheme (a value without one is read as https) and its port; only that exact port is authorized."
-    type = "string"
+  name        = "base_url"
+  label       = "API base URL"
+  description = "Override the API base URL, e.g. for a proxy or gateway. Include the API version the way an OpenAI SDK does, e.g. https://gateway.example.com/v1. The host you set here is automatically authorized for network egress. A local endpoint needs an explicit http:// scheme (a value without one is read as https) and its port; only that exact port is authorized."
+  type        = "string"
 
 [[options]]
-    name = "custom_model"
-    label = "Custom model name"
-    description = "Model name to request when the \"other\" model is selected, e.g. Systran/faster-whisper-large-v3. Ignored for the listed OpenAI models. Use it with an API base URL pointing at the server that serves the model."
-    type = "string"
+  name        = "custom_model"
+  label       = "Custom model name"
+  description = "Model name to request when the \"other\" or \"other-realtime\" model is selected, e.g. Systran/faster-whisper-large-v3. Ignored for the listed OpenAI models. Use it with an API base URL pointing at the server that serves the model."
+  type        = "string"
 
 [[models]]
-    name = "whisper-1"
-    provider = "openai"
-    multilingual = true
-    primary_language = "en"
-    supported_languages = [
-        "en",
-        "af",
-        "ar",
-        "az",
-        "be",
-        "bg",
-        "bs",
-        "ca",
-        "cs",
-        "cy",
-        "da",
-        "de",
-        "el",
-        "es",
-        "et",
-        "fa",
-        "fi",
-        "fr",
-        "gl",
-        "he",
-        "hi",
-        "hr",
-        "hu",
-        "hy",
-        "id",
-        "is",
-        "it",
-        "ja",
-        "kk",
-        "kn",
-        "ko",
-        "lt",
-        "lv",
-        "mi",
-        "mk",
-        "mr",
-        "ms",
-        "ne",
-        "nl",
-        "no",
-        "pl",
-        "pt",
-        "ro",
-        "ru",
-        "sk",
-        "sl",
-        "sr",
-        "sv",
-        "sw",
-        "ta",
-        "th",
-        "tl",
-        "tr",
-        "uk",
-        "ur",
-        "vi",
-        "zh",
-    ]
-    supported_devices = ["none"]
+  name                = "whisper-1"
+  provider            = "openai"
+  multilingual        = true
+  primary_language    = "en"
+  supported_languages = [
+    "en",
+    "af",
+    "ar",
+    "az",
+    "be",
+    "bg",
+    "bs",
+    "ca",
+    "cs",
+    "cy",
+    "da",
+    "de",
+    "el",
+    "es",
+    "et",
+    "fa",
+    "fi",
+    "fr",
+    "gl",
+    "he",
+    "hi",
+    "hr",
+    "hu",
+    "hy",
+    "id",
+    "is",
+    "it",
+    "ja",
+    "kk",
+    "kn",
+    "ko",
+    "lt",
+    "lv",
+    "mi",
+    "mk",
+    "mr",
+    "ms",
+    "ne",
+    "nl",
+    "no",
+    "pl",
+    "pt",
+    "ro",
+    "ru",
+    "sk",
+    "sl",
+    "sr",
+    "sv",
+    "sw",
+    "ta",
+    "th",
+    "tl",
+    "tr",
+    "uk",
+    "ur",
+    "vi",
+    "zh",
+  ]
+  supported_devices   = ["none"]
 
 [[models]]
-    name = "gpt-4o-transcribe"
-    provider = "openai"
-    multilingual = true
-    primary_language = "en"
-    supported_languages = [
-        "en",
-        "af",
-        "ar",
-        "az",
-        "be",
-        "bg",
-        "bs",
-        "ca",
-        "cs",
-        "cy",
-        "da",
-        "de",
-        "el",
-        "es",
-        "et",
-        "fa",
-        "fi",
-        "fr",
-        "gl",
-        "he",
-        "hi",
-        "hr",
-        "hu",
-        "hy",
-        "id",
-        "is",
-        "it",
-        "ja",
-        "kk",
-        "kn",
-        "ko",
-        "lt",
-        "lv",
-        "mi",
-        "mk",
-        "mr",
-        "ms",
-        "ne",
-        "nl",
-        "no",
-        "pl",
-        "pt",
-        "ro",
-        "ru",
-        "sk",
-        "sl",
-        "sr",
-        "sv",
-        "sw",
-        "ta",
-        "th",
-        "tl",
-        "tr",
-        "uk",
-        "ur",
-        "vi",
-        "zh",
-    ]
-    supported_devices = ["none"]
+  name                = "gpt-4o-transcribe"
+  provider            = "openai"
+  multilingual        = true
+  primary_language    = "en"
+  supported_languages = [
+    "en",
+    "af",
+    "ar",
+    "az",
+    "be",
+    "bg",
+    "bs",
+    "ca",
+    "cs",
+    "cy",
+    "da",
+    "de",
+    "el",
+    "es",
+    "et",
+    "fa",
+    "fi",
+    "fr",
+    "gl",
+    "he",
+    "hi",
+    "hr",
+    "hu",
+    "hy",
+    "id",
+    "is",
+    "it",
+    "ja",
+    "kk",
+    "kn",
+    "ko",
+    "lt",
+    "lv",
+    "mi",
+    "mk",
+    "mr",
+    "ms",
+    "ne",
+    "nl",
+    "no",
+    "pl",
+    "pt",
+    "ro",
+    "ru",
+    "sk",
+    "sl",
+    "sr",
+    "sv",
+    "sw",
+    "ta",
+    "th",
+    "tl",
+    "tr",
+    "uk",
+    "ur",
+    "vi",
+    "zh",
+  ]
+  supported_devices   = ["none"]
 
 [[models]]
-    name = "gpt-4o-mini-transcribe"
-    provider = "openai"
-    multilingual = true
-    primary_language = "en"
-    supported_languages = [
-        "en",
-        "af",
-        "ar",
-        "az",
-        "be",
-        "bg",
-        "bs",
-        "ca",
-        "cs",
-        "cy",
-        "da",
-        "de",
-        "el",
-        "es",
-        "et",
-        "fa",
-        "fi",
-        "fr",
-        "gl",
-        "he",
-        "hi",
-        "hr",
-        "hu",
-        "hy",
-        "id",
-        "is",
-        "it",
-        "ja",
-        "kk",
-        "kn",
-        "ko",
-        "lt",
-        "lv",
-        "mi",
-        "mk",
-        "mr",
-        "ms",
-        "ne",
-        "nl",
-        "no",
-        "pl",
-        "pt",
-        "ro",
-        "ru",
-        "sk",
-        "sl",
-        "sr",
-        "sv",
-        "sw",
-        "ta",
-        "th",
-        "tl",
-        "tr",
-        "uk",
-        "ur",
-        "vi",
-        "zh",
-    ]
-    supported_devices = ["none"]
+  name                = "gpt-4o-mini-transcribe"
+  provider            = "openai"
+  multilingual        = true
+  primary_language    = "en"
+  supported_languages = [
+    "en",
+    "af",
+    "ar",
+    "az",
+    "be",
+    "bg",
+    "bs",
+    "ca",
+    "cs",
+    "cy",
+    "da",
+    "de",
+    "el",
+    "es",
+    "et",
+    "fa",
+    "fi",
+    "fr",
+    "gl",
+    "he",
+    "hi",
+    "hr",
+    "hu",
+    "hy",
+    "id",
+    "is",
+    "it",
+    "ja",
+    "kk",
+    "kn",
+    "ko",
+    "lt",
+    "lv",
+    "mi",
+    "mk",
+    "mr",
+    "ms",
+    "ne",
+    "nl",
+    "no",
+    "pl",
+    "pt",
+    "ro",
+    "ru",
+    "sk",
+    "sl",
+    "sr",
+    "sv",
+    "sw",
+    "ta",
+    "th",
+    "tl",
+    "tr",
+    "uk",
+    "ur",
+    "vi",
+    "zh",
+  ]
+  supported_devices   = ["none"]
 
 # Placeholder for a model this manifest does not list — one served by an
 # OpenAI-compatible endpoint set through `base_url`. The name sent upstream comes
@@ -242,67 +249,208 @@
 # error. The language list matches the OpenAI models because the served model is
 # unknown here, so nothing narrower would be honest.
 [[models]]
-    name = "other"
-    provider = "openai"
-    multilingual = true
-    primary_language = "en"
-    supported_languages = [
-        "en",
-        "af",
-        "ar",
-        "az",
-        "be",
-        "bg",
-        "bs",
-        "ca",
-        "cs",
-        "cy",
-        "da",
-        "de",
-        "el",
-        "es",
-        "et",
-        "fa",
-        "fi",
-        "fr",
-        "gl",
-        "he",
-        "hi",
-        "hr",
-        "hu",
-        "hy",
-        "id",
-        "is",
-        "it",
-        "ja",
-        "kk",
-        "kn",
-        "ko",
-        "lt",
-        "lv",
-        "mi",
-        "mk",
-        "mr",
-        "ms",
-        "ne",
-        "nl",
-        "no",
-        "pl",
-        "pt",
-        "ro",
-        "ru",
-        "sk",
-        "sl",
-        "sr",
-        "sv",
-        "sw",
-        "ta",
-        "th",
-        "tl",
-        "tr",
-        "uk",
-        "ur",
-        "vi",
-        "zh",
-    ]
-    supported_devices = ["none"]
+  name                = "other"
+  provider            = "openai"
+  multilingual        = true
+  primary_language    = "en"
+  supported_languages = [
+    "en",
+    "af",
+    "ar",
+    "az",
+    "be",
+    "bg",
+    "bs",
+    "ca",
+    "cs",
+    "cy",
+    "da",
+    "de",
+    "el",
+    "es",
+    "et",
+    "fa",
+    "fi",
+    "fr",
+    "gl",
+    "he",
+    "hi",
+    "hr",
+    "hu",
+    "hy",
+    "id",
+    "is",
+    "it",
+    "ja",
+    "kk",
+    "kn",
+    "ko",
+    "lt",
+    "lv",
+    "mi",
+    "mk",
+    "mr",
+    "ms",
+    "ne",
+    "nl",
+    "no",
+    "pl",
+    "pt",
+    "ro",
+    "ru",
+    "sk",
+    "sl",
+    "sr",
+    "sv",
+    "sw",
+    "ta",
+    "th",
+    "tl",
+    "tr",
+    "uk",
+    "ur",
+    "vi",
+    "zh",
+  ]
+  supported_devices   = ["none"]
+
+# OpenAI's realtime transcription model, driven over the consumer WebSocket
+# (`GET /v1/transcribe/realtime`) instead of batch `POST /v1/transcribe`. It is
+# the one model here that streams incremental transcripts back as it hears them.
+[[models]]
+  name                = "gpt-live-transcribe"
+  provider            = "openai"
+  multilingual        = true
+  primary_language    = "en"
+  supported_languages = [
+    "en",
+    "af",
+    "ar",
+    "az",
+    "be",
+    "bg",
+    "bs",
+    "ca",
+    "cs",
+    "cy",
+    "da",
+    "de",
+    "el",
+    "es",
+    "et",
+    "fa",
+    "fi",
+    "fr",
+    "gl",
+    "he",
+    "hi",
+    "hr",
+    "hu",
+    "hy",
+    "id",
+    "is",
+    "it",
+    "ja",
+    "kk",
+    "kn",
+    "ko",
+    "lt",
+    "lv",
+    "mi",
+    "mk",
+    "mr",
+    "ms",
+    "ne",
+    "nl",
+    "no",
+    "pl",
+    "pt",
+    "ro",
+    "ru",
+    "sk",
+    "sl",
+    "sr",
+    "sv",
+    "sw",
+    "ta",
+    "th",
+    "tl",
+    "tr",
+    "uk",
+    "ur",
+    "vi",
+    "zh",
+  ]
+  supported_devices   = ["none"]
+  realtime            = true
+
+# The realtime counterpart of `other`: a model this manifest does not list,
+# served over the realtime WebSocket by an OpenAI-compatible endpoint set
+# through `base_url`. The name sent upstream comes from the same `custom_model`
+# option, and selecting it without setting one is the same error.
+[[models]]
+  name                = "other-realtime"
+  provider            = "openai"
+  multilingual        = true
+  primary_language    = "en"
+  supported_languages = [
+    "en",
+    "af",
+    "ar",
+    "az",
+    "be",
+    "bg",
+    "bs",
+    "ca",
+    "cs",
+    "cy",
+    "da",
+    "de",
+    "el",
+    "es",
+    "et",
+    "fa",
+    "fi",
+    "fr",
+    "gl",
+    "he",
+    "hi",
+    "hr",
+    "hu",
+    "hy",
+    "id",
+    "is",
+    "it",
+    "ja",
+    "kk",
+    "kn",
+    "ko",
+    "lt",
+    "lv",
+    "mi",
+    "mk",
+    "mr",
+    "ms",
+    "ne",
+    "nl",
+    "no",
+    "pl",
+    "pt",
+    "ro",
+    "ru",
+    "sk",
+    "sl",
+    "sr",
+    "sv",
+    "sw",
+    "ta",
+    "th",
+    "tl",
+    "tr",
+    "uk",
+    "ur",
+    "vi",
+    "zh",
+  ]
+  supported_devices   = ["none"]
+  realtime            = true

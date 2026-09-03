@@ -1,33 +1,65 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Self-contained wasmtime host harness that "plays the daemon": it loads the
-//! prebuilt OpenAI component and drives the `/v1` contract in-process, exactly
-//! as Super STT's daemon does, while confining the component's outbound egress
-//! to an allowlist with the same SSRF guard. This repo shares no code with
-//! super-stt — the harness is a minimal, independent reimplementation of the
-//! daemon's `WasmBackend` (batch `/v1` only; no realtime).
+//! prebuilt OpenAI component and drives both halves of the `realtime-backend`
+//! world in-process, exactly as Super STT's daemon does — the batch `/v1`
+//! contract over `wasi:http`, and the `super-stt:realtime` WebSocket session —
+//! while confining the component's outbound egress to an allowlist with the
+//! same SSRF guard. This repo shares no code with super-stt; the harness is a
+//! minimal, independent reimplementation of the daemon's `WasmBackend`
+//! (`stt_models/wasm/{mod,host,ws_host}.rs`).
 //!
-//! Tests pair this with a `wiremock` mock of the *OpenAI upstream*, so both
-//! sides of the contract the component speaks (daemon ⇄ component ⇄ upstream)
-//! are mocked.
+//! Tests pair it with mocks of the *OpenAI upstream*: `wiremock` for the batch
+//! HTTP API and a `tokio-tungstenite` server for the realtime WebSocket — so
+//! every side of the contract the component speaks (daemon ⇄ component ⇄
+//! upstream) is mocked, and the component itself is real.
 
-#![allow(dead_code)] // not every test uses every helper
+// Not every test uses every helper.
+#![allow(dead_code)]
+// The `ws` host methods below implement `bindgen!`-generated `async` trait
+// methods. Several need no `.await` — a channel send, a table lookup — but the
+// signature is the trait's, not ours, so the `async` cannot be dropped.
+#![allow(unknown_lints, clippy::unused_async_trait_impl)]
 
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use wasmtime::component::{Component, Linker, ResourceTable};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::Uri;
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use wasmtime::component::{Component, Linker, Resource, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
-use wasmtime_wasi_http::p2::bindings::ProxyPre;
 use wasmtime_wasi_http::p2::bindings::http::types::{ErrorCode, Scheme};
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
 use wasmtime_wasi_http::p2::{
     HttpResult, WasiHttpCtxView, WasiHttpHooks, WasiHttpView, default_send_request,
 };
+
+// Host-side bindings for the realtime world. Only the outgoing `ws` interface is
+// implemented here; the wasi:* deps are aliased to wasmtime's existing generated
+// bindings so the resource/type definitions unify with `add_to_linker_async`.
+wasmtime::component::bindgen!({
+    path: "wit",
+    world: "realtime-backend",
+    imports: { default: async | trappable },
+    exports: { default: async },
+    with: {
+        "wasi:io": wasmtime_wasi::p2::bindings::io,
+        "wasi:clocks": wasmtime_wasi::p2::bindings::clocks,
+        "wasi:http": wasmtime_wasi_http::p2::bindings::http,
+        "super-stt:realtime/ws.ws-stream": WsStreamResource,
+        "super-stt:realtime/ws.consumer-stream": ConsumerStreamResource,
+    },
+});
+
+pub use self::super_stt::realtime::ws::{CloseFrame, WsError, WsFrame};
 
 /// Path to the prebuilt component (`just build-component`), or `None` if it
 /// isn't built — tests skip gracefully in that case so a partial `cargo test`
@@ -115,6 +147,25 @@ impl WasiHttpHooks for AllowlistHooks {
     }
 }
 
+/// Confine an outbound connection to `allowed` + run the SSRF resolver guard.
+/// Shared by the HTTP hook and the `ws` host so both transports enforce
+/// identical egress rules (mirrors the daemon's `host::check_host_allowed`).
+fn check_host_allowed(
+    allowed: &[String],
+    host: &str,
+    port: u16,
+    allow_loopback: bool,
+) -> Result<(), String> {
+    let authority = format!("{host}:{port}");
+    let on_allowlist = allowed
+        .iter()
+        .any(|a| a.as_str() == host || a.as_str() == authority);
+    if !on_allowlist {
+        return Err(format!("outbound host not allowed: {host}"));
+    }
+    guard_egress_host(host, port, allow_loopback)
+}
+
 fn guard_egress_host(host: &str, port: u16, allow_loopback: bool) -> Result<(), String> {
     // `Uri::host` keeps the brackets around an IPv6 literal (`[::1]`); they are
     // URI syntax, not part of the address, so strip them before parsing.
@@ -171,12 +222,334 @@ fn is_disallowed_v4(v4: Ipv4Addr) -> bool {
         || v4.is_broadcast()
 }
 
+// ── outgoing `super-stt:realtime/ws` host (mirrors the daemon's ws_host.rs) ──
+
+/// A live outgoing WebSocket owned by the host. `None` once closed.
+pub struct WsStreamResource {
+    stream: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    /// One-frame lookahead, mirroring the daemon: `wasi:io/poll` asks whether a
+    /// stream is readable without taking anything, but a `WebSocketStream` only
+    /// answers by consuming — so `ready` reads one frame and parks it for the
+    /// `recv` that follows.
+    pending: Option<std::result::Result<WsFrame, WsError>>,
+}
+
+impl WsStreamResource {
+    async fn next_frame(&mut self) -> std::result::Result<WsFrame, WsError> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Err(WsError::Closed);
+        };
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    return Ok(WsFrame::Text(text.as_str().to_string()));
+                }
+                Some(Ok(Message::Binary(data))) => return Ok(WsFrame::Binary(data.into())),
+                Some(Ok(Message::Close(frame))) => {
+                    self.stream = None;
+                    let close = frame.map_or(
+                        CloseFrame {
+                            code: 1005,
+                            reason: String::new(),
+                        },
+                        |f| CloseFrame {
+                            code: f.code.into(),
+                            reason: f.reason.as_str().to_string(),
+                        },
+                    );
+                    return Ok(WsFrame::Close(close));
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+                Some(Err(e)) => {
+                    self.stream = None;
+                    return Err(WsError::RecvFailed(format!("recv failed: {e}")));
+                }
+                None => {
+                    self.stream = None;
+                    return Err(WsError::Closed);
+                }
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl wasmtime_wasi::p2::Pollable for WsStreamResource {
+    async fn ready(&mut self) {
+        if self.pending.is_none() {
+            self.pending = Some(self.next_frame().await);
+        }
+    }
+}
+
+/// The host-side bridge between the test's consumer channels and the guest's
+/// realtime session. The test owns the opposite ends: it sends frames into
+/// `incoming` and reads frames the guest emits off `outgoing`.
+pub struct ConsumerStreamTransport {
+    /// Frames arriving FROM the consumer TO the guest.
+    pub incoming: tokio::sync::mpsc::UnboundedReceiver<WsFrame>,
+    /// Frames the guest sends OUT to the consumer.
+    pub outgoing: tokio::sync::mpsc::UnboundedSender<WsFrame>,
+}
+
+/// A live consumer WebSocket the harness owns and hands to the guest's
+/// `ws-server.handle`. `None` once the session is closed.
+pub struct ConsumerStreamResource {
+    transport: Option<ConsumerStreamTransport>,
+    /// One-frame lookahead, for the same reason as `WsStreamResource::pending`.
+    pending: Option<std::result::Result<WsFrame, WsError>>,
+}
+
+impl ConsumerStreamResource {
+    async fn next_frame(&mut self) -> std::result::Result<WsFrame, WsError> {
+        let Some(transport) = self.transport.as_mut() else {
+            return Err(WsError::Closed);
+        };
+        if let Some(frame) = transport.incoming.recv().await {
+            Ok(frame)
+        } else {
+            self.transport = None;
+            Err(WsError::Closed)
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl wasmtime_wasi::p2::Pollable for ConsumerStreamResource {
+    async fn ready(&mut self) {
+        if self.pending.is_none() {
+            self.pending = Some(self.next_frame().await);
+        }
+    }
+}
+
+/// WebSocket handshake headers the host owns; a guest-supplied header with one
+/// of these names is dropped so it cannot corrupt the upgrade request.
+const RESERVED_HEADERS: &[&str] = &[
+    "host",
+    "connection",
+    "upgrade",
+    "sec-websocket-key",
+    "sec-websocket-version",
+];
+
+impl self::super_stt::realtime::ws::Host for Host {
+    async fn connect(
+        &mut self,
+        url: String,
+        headers: Vec<(String, Vec<u8>)>,
+    ) -> wasmtime::Result<std::result::Result<Resource<WsStreamResource>, WsError>> {
+        let uri: Uri = match url.parse() {
+            Ok(u) => u,
+            Err(e) => return Ok(Err(WsError::InvalidUrl(format!("invalid url: {e}")))),
+        };
+
+        match uri.scheme_str() {
+            Some("ws" | "wss") => {}
+            other => {
+                return Ok(Err(WsError::InvalidUrl(format!(
+                    "scheme must be ws or wss, got {}",
+                    other.unwrap_or("<none>")
+                ))));
+            }
+        }
+
+        let Some(host) = uri.host() else {
+            return Ok(Err(WsError::InvalidUrl("url has no host".to_string())));
+        };
+        let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+            Some("ws") => 80,
+            _ => 443,
+        });
+
+        if let Err(msg) = check_host_allowed(
+            &self.hooks.allowed_hosts,
+            host,
+            port,
+            self.hooks.allow_loopback,
+        ) {
+            return Ok(Err(WsError::HostNotAllowed(msg)));
+        }
+
+        let mut request = match uri.into_client_request() {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(WsError::InvalidUrl(format!("invalid url: {e}")))),
+        };
+        for (name, value) in headers {
+            if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+                continue;
+            }
+            let header_name = match name.parse::<tokio_tungstenite::tungstenite::http::HeaderName>()
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    return Ok(Err(WsError::ConnectFailed(format!(
+                        "invalid header name {name}: {e}"
+                    ))));
+                }
+            };
+            let header_value =
+                match tokio_tungstenite::tungstenite::http::HeaderValue::from_bytes(&value) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Ok(Err(WsError::ConnectFailed(format!(
+                            "invalid header value for {name}: {e}"
+                        ))));
+                    }
+                };
+            request.headers_mut().append(header_name, header_value);
+        }
+
+        match connect_async(request).await {
+            Ok((stream, _response)) => {
+                let resource = self.table.push(WsStreamResource {
+                    stream: Some(stream),
+                    pending: None,
+                })?;
+                Ok(Ok(resource))
+            }
+            Err(e) => Ok(Err(WsError::ConnectFailed(format!("connect failed: {e}")))),
+        }
+    }
+}
+
+impl self::super_stt::realtime::ws::HostWsStream for Host {
+    async fn send_text(
+        &mut self,
+        self_: Resource<WsStreamResource>,
+        text: String,
+    ) -> wasmtime::Result<std::result::Result<(), WsError>> {
+        let res = self.table.get_mut(&self_)?;
+        let Some(stream) = res.stream.as_mut() else {
+            return Ok(Err(WsError::Closed));
+        };
+        match stream.send(Message::Text(text.into())).await {
+            Ok(()) => Ok(Ok(())),
+            Err(e) => Ok(Err(WsError::SendFailed(format!("send failed: {e}")))),
+        }
+    }
+
+    async fn send_binary(
+        &mut self,
+        self_: Resource<WsStreamResource>,
+        data: Vec<u8>,
+    ) -> wasmtime::Result<std::result::Result<(), WsError>> {
+        let res = self.table.get_mut(&self_)?;
+        let Some(stream) = res.stream.as_mut() else {
+            return Ok(Err(WsError::Closed));
+        };
+        match stream.send(Message::Binary(data.into())).await {
+            Ok(()) => Ok(Ok(())),
+            Err(e) => Ok(Err(WsError::SendFailed(format!("send failed: {e}")))),
+        }
+    }
+
+    async fn recv(
+        &mut self,
+        self_: Resource<WsStreamResource>,
+    ) -> wasmtime::Result<std::result::Result<WsFrame, WsError>> {
+        let res = self.table.get_mut(&self_)?;
+        if let Some(frame) = res.pending.take() {
+            return Ok(frame);
+        }
+        Ok(res.next_frame().await)
+    }
+
+    async fn subscribe(
+        &mut self,
+        self_: Resource<WsStreamResource>,
+    ) -> wasmtime::Result<Resource<wasmtime_wasi::p2::bindings::io::poll::Pollable>> {
+        wasmtime_wasi::p2::subscribe(&mut self.table, self_)
+    }
+
+    async fn close(
+        &mut self,
+        self_: Resource<WsStreamResource>,
+    ) -> wasmtime::Result<std::result::Result<(), WsError>> {
+        let res = self.table.get_mut(&self_)?;
+        if let Some(mut stream) = res.stream.take() {
+            let _ = stream.close(None).await;
+        }
+        Ok(Ok(()))
+    }
+
+    async fn drop(&mut self, rep: Resource<WsStreamResource>) -> wasmtime::Result<()> {
+        let _ = self.table.delete(rep)?;
+        Ok(())
+    }
+}
+
+impl self::super_stt::realtime::ws::HostConsumerStream for Host {
+    async fn send_text(
+        &mut self,
+        self_: Resource<ConsumerStreamResource>,
+        text: String,
+    ) -> wasmtime::Result<std::result::Result<(), WsError>> {
+        let res = self.table.get_mut(&self_)?;
+        let Some(transport) = res.transport.as_mut() else {
+            return Ok(Err(WsError::Closed));
+        };
+        match transport.outgoing.send(WsFrame::Text(text)) {
+            Ok(()) => Ok(Ok(())),
+            Err(e) => Ok(Err(WsError::SendFailed(format!("consumer gone: {e}")))),
+        }
+    }
+
+    async fn send_binary(
+        &mut self,
+        self_: Resource<ConsumerStreamResource>,
+        data: Vec<u8>,
+    ) -> wasmtime::Result<std::result::Result<(), WsError>> {
+        let res = self.table.get_mut(&self_)?;
+        let Some(transport) = res.transport.as_mut() else {
+            return Ok(Err(WsError::Closed));
+        };
+        match transport.outgoing.send(WsFrame::Binary(data)) {
+            Ok(()) => Ok(Ok(())),
+            Err(e) => Ok(Err(WsError::SendFailed(format!("consumer gone: {e}")))),
+        }
+    }
+
+    async fn recv(
+        &mut self,
+        self_: Resource<ConsumerStreamResource>,
+    ) -> wasmtime::Result<std::result::Result<WsFrame, WsError>> {
+        let res = self.table.get_mut(&self_)?;
+        if let Some(frame) = res.pending.take() {
+            return Ok(frame);
+        }
+        Ok(res.next_frame().await)
+    }
+
+    async fn subscribe(
+        &mut self,
+        self_: Resource<ConsumerStreamResource>,
+    ) -> wasmtime::Result<Resource<wasmtime_wasi::p2::bindings::io::poll::Pollable>> {
+        wasmtime_wasi::p2::subscribe(&mut self.table, self_)
+    }
+
+    async fn close(
+        &mut self,
+        self_: Resource<ConsumerStreamResource>,
+    ) -> wasmtime::Result<std::result::Result<(), WsError>> {
+        let res = self.table.get_mut(&self_)?;
+        res.transport = None;
+        Ok(Ok(()))
+    }
+
+    async fn drop(&mut self, rep: Resource<ConsumerStreamResource>) -> wasmtime::Result<()> {
+        let _ = self.table.delete(rep)?;
+        Ok(())
+    }
+}
+
 // ── the backend driver ──────────────────────────────────────────────────────
 
-/// A loaded OpenAI component, driven over the batch `/v1` contract.
+/// A loaded OpenAI component, driven over the batch `/v1` contract and the
+/// realtime `ws-server` session.
 pub struct WasmBackend {
     engine: Engine,
-    pre: ProxyPre<Host>,
+    pre: RealtimeBackendPre<Host>,
     allowed_hosts: Vec<String>,
     allow_loopback: bool,
     transcribe_headers: Vec<(String, String)>,
@@ -184,7 +557,7 @@ pub struct WasmBackend {
 }
 
 impl WasmBackend {
-    /// Load a component the way the daemon does: secrets/options are the
+    /// Load the component the way the daemon does: secrets/options are the
     /// already-formed `x-stt-secret-*` / `x-stt-option-*` header pairs.
     ///
     /// # Errors
@@ -203,7 +576,11 @@ impl WasmBackend {
         let mut linker: Linker<Host> = Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
-        let pre = ProxyPre::new(linker.instantiate_pre(&component)?)?;
+        self::super_stt::realtime::ws::add_to_linker::<Host, wasmtime::component::HasSelf<Host>>(
+            &mut linker,
+            |h| h,
+        )?;
+        let pre = RealtimeBackendPre::new(linker.instantiate_pre(&component)?)?;
         Ok(Self {
             engine,
             pre,
@@ -222,14 +599,8 @@ impl WasmBackend {
         self
     }
 
-    async fn invoke(
-        &self,
-        method: &str,
-        path: &str,
-        headers: &[(String, String)],
-        body: Vec<u8>,
-    ) -> Result<(u16, Vec<u8>)> {
-        let host = Host {
+    fn new_host(&self) -> Host {
+        Host {
             table: ResourceTable::new(),
             wasi: WasiCtx::builder().build(),
             http: WasiHttpCtx::new(),
@@ -237,8 +608,17 @@ impl WasmBackend {
                 allowed_hosts: self.allowed_hosts.clone(),
                 allow_loopback: self.allow_loopback,
             },
-        };
-        let mut store = Store::new(&self.engine, host);
+        }
+    }
+
+    async fn invoke(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+    ) -> Result<(u16, Vec<u8>)> {
+        let mut store = Store::new(&self.engine, self.new_host());
 
         let mut builder = hyper::Request::builder()
             .method(method)
@@ -259,9 +639,10 @@ impl WasmBackend {
             .http()
             .new_incoming_request(Scheme::Http, request)?;
         let out = store.data_mut().http().new_response_outparam(tx)?;
-        let proxy = self.pre.instantiate_async(&mut store).await?;
-        proxy
-            .wasi_http_incoming_handler()
+        // Both worlds export `wasi:http/incoming-handler`, so the batch `/v1`
+        // path works for a realtime backend's non-realtime models too.
+        let inst = self.pre.instantiate_async(&mut store).await?;
+        inst.wasi_http_incoming_handler()
             .call_handle(&mut store, req, out)
             .await?;
 
@@ -343,5 +724,35 @@ impl WasmBackend {
                 .unwrap_or("transcription failed");
             bail!("{msg}");
         }
+    }
+
+    /// Run one consumer realtime session: instantiate the component and invoke
+    /// its `super-stt:realtime/ws-server.handle` export with the injected
+    /// headers and a host-owned consumer stream. Returns when the guest's
+    /// handler returns.
+    ///
+    /// # Errors
+    /// Returns an error if instantiation fails or the guest's handler returns a
+    /// `ws-error`.
+    pub async fn realtime_session(&self, transport: ConsumerStreamTransport) -> Result<()> {
+        let mut store = Store::new(&self.engine, self.new_host());
+        let mut headers: Vec<(String, Vec<u8>)> = self
+            .transcribe_headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone().into_bytes()))
+            .collect();
+        headers.push((
+            "x-stt-model".to_string(),
+            self.model_id.clone().into_bytes(),
+        ));
+        let consumer = store.data_mut().table.push(ConsumerStreamResource {
+            transport: Some(transport),
+            pending: None,
+        })?;
+        let inst = self.pre.instantiate_async(&mut store).await?;
+        inst.super_stt_realtime_ws_server()
+            .call_handle(&mut store, &headers, consumer)
+            .await?
+            .map_err(|e| anyhow!("ws-server.handle returned error: {e:?}"))
     }
 }
