@@ -574,7 +574,14 @@ impl WasmBackend {
         let component = Component::from_file(&engine, component_path)
             .map_err(|e| anyhow!("loading component {}: {e}", component_path.display()))?;
         let mut linker: Linker<Host> = Linker::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        // `exit-with-code` is still `@unstable` in wasi:cli, so wasmtime leaves
+        // it out of the linker by default. Nightly's wasm32-wasip2 std imports
+        // it (wasi:cli/exit@0.2.12), so a component built there fails to link
+        // against the default set — opt in, as a host that runs any toolchain's
+        // component must.
+        let mut wasi_opts = wasmtime_wasi::p2::bindings::LinkOptions::default();
+        wasi_opts.cli_exit_with_code(true);
+        wasmtime_wasi::p2::add_to_linker_with_options_async(&mut linker, &wasi_opts)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
         self::super_stt::realtime::ws::add_to_linker::<Host, wasmtime::component::HasSelf<Host>>(
             &mut linker,
