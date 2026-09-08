@@ -8,7 +8,8 @@ hosted transcription API, so transcription runs in the cloud rather than on your
 
 Super STT is an on-device speech-to-text engine. It doesn't ship any models of its own —
 it loads **backends** like this one at runtime. This repo packages OpenAI as one of those
-backends, shipped as a sandboxed **WASM component** (a `wasi:http` proxy).
+backends, shipped as a sandboxed **WASM component** that serves both transports: batch
+transcription over `wasi:http`, and streaming transcription over a WebSocket.
 
 ## Using it
 
@@ -24,12 +25,14 @@ Chosen by `name` when Super STT loads the backend. These are **online** models: 
 audio to OpenAI and need an OpenAI API key (set in the app); no local GPU or weights are
 involved.
 
-| Model (`name`)           | Provider | Type   | Languages | Requires                       |
-| ------------------------ | -------- | ------ | --------- | ------------------------------ |
-| `whisper-1`              | openai   | online | en        | OpenAI API key                 |
-| `gpt-4o-transcribe`      | openai   | online | en        | OpenAI API key                 |
-| `gpt-4o-mini-transcribe` | openai   | online | en        | OpenAI API key                 |
-| `other`                  | openai   | online | en        | **Custom model name**          |
+| Model (`name`)           | Provider | Type     | Languages | Requires                       |
+| ------------------------ | -------- | -------- | --------- | ------------------------------ |
+| `whisper-1`              | openai   | online   | en        | OpenAI API key                 |
+| `gpt-4o-transcribe`      | openai   | online   | en        | OpenAI API key                 |
+| `gpt-4o-mini-transcribe` | openai   | online   | en        | OpenAI API key                 |
+| `other`                  | openai   | online   | en        | **Custom model name**          |
+| `gpt-live-transcribe`    | openai   | realtime | en        | OpenAI API key                 |
+| `other-realtime`         | openai   | realtime | en        | **Custom model name**          |
 
 `other` is a placeholder for a model this backend does not list — one served by
 an OpenAI-compatible endpoint. Set **Custom model name** to the name that server
@@ -37,7 +40,8 @@ expects (e.g. `Systran/faster-whisper-large-v3`) and it is sent instead of
 `other`; point **API base URL** at the server, including the API version
 (`http://localhost:8000/v1`). Selecting `other` without a custom model name is an
 error rather than a request for a model called `other`. Both settings are ignored
-by the listed OpenAI models.
+by the listed OpenAI models. `other-realtime` is the same placeholder on the
+realtime transport, and reads the same **Custom model name**.
 
 The **OpenAI API key** is optional. It is required to reach `api.openai.com` —
 requests there are refused without one, since they can only come back 401 — but a
@@ -45,14 +49,33 @@ self-hosted or gateway endpoint set through **API base URL** is called with no
 `Authorization` header at all when no key is set. Set a key and it is sent as
 `Bearer` to whatever endpoint is configured.
 
+## Realtime
+
+The `realtime` models stream instead of uploading a finished recording. Super STT hands
+the component a live consumer WebSocket, and the component bridges it to OpenAI's realtime
+transcription API (`wss://api.openai.com/v1/realtime?intent=transcription`) — or to the
+same endpoint on whatever server **API base URL** names. Partial transcripts come back as
+`preview` frames and the final one as `done`.
+
+Two details are worth knowing:
+
+- **Sample rate.** OpenAI's realtime API accepts 24 kHz PCM only, and Super STT streams
+  at whatever rate the session declares (16 kHz, typically), so the component resamples on
+  the way upstream. Nothing to configure.
+- **Previews arrive late.** The host does not yet implement `wasi:io/poll` for WebSocket
+  resources, so the component cannot wait on the consumer and OpenAI at the same time. It
+  runs half-duplex: all audio goes up first, then the transcript events come back. The
+  partials still arrive, but in a burst near the end rather than as you speak.
+
 ## What's in here
 
-A small, self-contained Rust `wasi:http` component (`src/lib.rs`) that speaks the Super
-STT backend protocol (the `/v1` contract) and forwards audio to OpenAI over
-`wasi:http/outgoing-handler`. It shares no code with the Super STT project. The pure
-audio/parsing helpers are unit-tested natively; the component as a whole is exercised by a
-wasmtime harness under `tests/` that loads the built `.wasm` and drives `/v1` against a
-mock upstream.
+A small, self-contained Rust component (`src/lib.rs` plus `src/component/`) that speaks
+the Super STT backend protocol — the `/v1` contract over `wasi:http`, and the
+`super-stt:realtime` WebSocket session — and forwards audio to OpenAI. It shares no code
+with the Super STT project; `wit/` is a vendored copy of the protocol's WIT. The pure
+audio, request-shaping, and realtime-payload helpers are unit-tested natively; the
+component as a whole is exercised by a wasmtime harness under `tests/` that loads the
+built `.wasm` and drives both transports against mock upstreams.
 
 ## Building from source
 
