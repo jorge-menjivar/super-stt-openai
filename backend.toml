@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-only
-#:schema https://jorge-menjivar.github.io/super-stt/backend.schema.json
+#:schema https://jorge-menjivar.github.io/super-voice/backend.schema.json
 # OpenAI backend configuration. See docs/protocol/backend/config.md.
 
 [backend]
@@ -9,7 +9,8 @@
   version     = "0.1.2"
   kind        = "wasm"
   entrypoint  = "openai.wasm"
-  contract    = "v2"
+  product     = "super-voice"
+  contract    = "v1"
   license     = "GPL-3.0-only"
   description = "Cloud speech-to-text via the OpenAI API."
 
@@ -47,6 +48,7 @@
 
 [[models]]
   name                = "whisper-1"
+  role                = "transcription"
   provider            = "openai"
   multilingual        = true
   primary_language    = "en"
@@ -113,6 +115,7 @@
 
 [[models]]
   name                = "gpt-4o-transcribe"
+  role                = "transcription"
   provider            = "openai"
   multilingual        = true
   primary_language    = "en"
@@ -179,6 +182,7 @@
 
 [[models]]
   name                = "gpt-4o-mini-transcribe"
+  role                = "transcription"
   provider            = "openai"
   multilingual        = true
   primary_language    = "en"
@@ -250,6 +254,7 @@
 # unknown here, so nothing narrower would be honest.
 [[models]]
   name                = "other"
+  role                = "transcription"
   provider            = "openai"
   multilingual        = true
   primary_language    = "en"
@@ -319,6 +324,7 @@
 # the one model here that streams incremental transcripts back as it hears them.
 [[models]]
   name                = "gpt-live-transcribe"
+  role                = "transcription"
   provider            = "openai"
   multilingual        = true
   primary_language    = "en"
@@ -390,6 +396,7 @@
 # option, and selecting it without setting one is the same error.
 [[models]]
   name                = "other-realtime"
+  role                = "transcription"
   provider            = "openai"
   multilingual        = true
   primary_language    = "en"
